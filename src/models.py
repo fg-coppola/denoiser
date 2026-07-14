@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torchvision
 
 
 class DoubleConv(nn.Module):
@@ -178,6 +179,34 @@ class RestorationModule(L.LightningModule):
 
         loss = self.criterion(reconstructed, clean)
         self.log("val_loss", loss, on_epoch=True, prog_bar=True, logger=True)
+
+        # Log images only for the very first batch of validation
+        if batch_idx == 0:
+            # Take the first sample from the batch (index 0)
+            # Add an extra dimension to keep the shape as [1, C, H, W]
+            n_img = noisy[0:1].detach().cpu()
+            r_img = reconstructed[0:1].detach().cpu()
+            c_img = clean[0:1].detach().cpu()
+
+            # Concatenate the three states along the batch dimension
+            # Resulting shape: [3, C, H, W]
+            comparison_tensor = torch.cat([n_img, r_img, c_img], dim=0)
+
+            # Create a side-by-side grid
+            # normalize=True automatically scales values to [0, 1] for correct rendering,
+            # which is extremely useful for audio spectrograms with raw dB values
+            grid = torchvision.utils.make_grid(
+                comparison_tensor, nrow=3, normalize=True
+            )
+
+            # Add the image grid to TensorBoard
+            # global_step acts as the X-axis in the dashboard slider
+            self.logger.experiment.add_image(
+                "Validation: 1.Noisy | 2.Reconstructed | 3.Clean",
+                grid,
+                global_step=self.global_step,
+            )
+
         return loss
 
     def configure_optimizers(self):
