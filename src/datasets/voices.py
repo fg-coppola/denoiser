@@ -3,7 +3,8 @@ import torchaudio
 from torch.utils.data import Dataset, Subset, random_split
 from torchvision import transforms
 
-from ..transforms.rir import ApplyRIR
+from transforms.rir import ApplyRIR
+
 from .base import BaseDataModule
 
 
