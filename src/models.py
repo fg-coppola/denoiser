@@ -147,7 +147,7 @@ class RestorationModule(L.LightningModule):
         lr: float = 1e-4,
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["loss_fn"])
 
         # Instantiate the U-Net with parameters
         self.model = UNet(
@@ -156,10 +156,13 @@ class RestorationModule(L.LightningModule):
             base_features=base_features,
         )
 
+        self.model = self.model.to(memory_format=torch.channels_last)
+
         # Use the provided loss function for training; default is L1 Loss
         self.criterion = loss_fn
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(memory_format=torch.channels_last)
         return self.model(x)
 
     def training_step(self, batch, batch_idx):
@@ -211,11 +214,14 @@ class RestorationModule(L.LightningModule):
 
     def configure_optimizers(self):
         # Standard Adam optimizer for general convergence stability
-        optimizer = optim.Adam(self.parameters(), lr=self.hparams.lr)
+        optimizer = optim.Adam(self.parameters(), lr=self.hparams.lr, fused=True)
 
         # Learning rate scheduler to fine-tune final epochs
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=5, verbose=True
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=5,
         )
 
         return {
