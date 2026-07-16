@@ -3,12 +3,12 @@ from pathlib import Path
 
 import pytorch_lightning as L
 import torch
-import torch.nn as nn
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from datasets.voices import RIRDataModule
+from losses.audio import HybridSpectrogramLoss
 from models import RestorationModule
 
 
@@ -31,7 +31,7 @@ def main(experiment_name: str, output_folder: str, training_subset: str = "dev-c
         in_channels=1,
         out_channels=1,
         base_features=32,
-        loss_fn=nn.L1Loss(),
+        loss_fn=HybridSpectrogramLoss(sc_weight=1.0),
         lr=1e-4,
     )
 
