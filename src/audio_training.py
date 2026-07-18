@@ -12,7 +12,13 @@ from losses.audio import CompositeSpectrogramLoss
 from models import RestorationModule
 
 
-def main(experiment_name: str, output_folder: str, training_subset: str = "dev-clean"):
+def main(
+    experiment_name: str,
+    output_folder: str,
+    training_subset: str = "dev-clean",
+    batch_size: int = 24,
+    base_features: int = 32,
+):
     # Setup high precision for matrix multiplication
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
@@ -35,7 +41,7 @@ def main(experiment_name: str, output_folder: str, training_subset: str = "dev-c
     rir_model = RestorationModule(
         in_channels=1,
         out_channels=1,
-        base_features=32,
+        base_features=base_features,
         loss_fn=criterion,
         lr=1e-4,
     )
@@ -46,7 +52,7 @@ def main(experiment_name: str, output_folder: str, training_subset: str = "dev-c
         rir_maps=None,
         subset=training_subset,
         download=True,
-        batch_size=32,
+        batch_size=batch_size,
         num_workers=4,
         persistent_workers=True,
     )
@@ -111,10 +117,24 @@ if __name__ == "__main__":
         default="dev-clean",
         help="Subset of LibriSpeech to use for training (e.g., 'dev-clean', 'train-clean-100')",
     )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=24,
+        help="Batch size for training",
+    )
+    parser.add_argument(
+        "--base_features",
+        type=int,
+        default=32,
+        help="Number of base features for the model",
+    )
     args = parser.parse_args()
 
     main(
         experiment_name=args.experiment_name,
         output_folder=args.output_folder,
         training_subset=args.training_subset,
+        batch_size=args.batch_size,
+        base_features=args.base_features,
     )
