@@ -8,7 +8,7 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from datasets.voices import RIRDataModule
-from losses.audio import HybridSpectrogramLoss
+from losses.audio import CompositeSpectrogramLoss
 from models import RestorationModule
 
 
@@ -27,11 +27,16 @@ def main(experiment_name: str, output_folder: str, training_subset: str = "dev-c
 
     logger = TensorBoardLogger(save_dir=logs_dir, name=experiment_name)
 
+    criterion = CompositeSpectrogramLoss(
+        lambda_l1=1.0,
+        lambda_sobel=0.2,
+        lambda_sc=0.1,
+    )
     rir_model = RestorationModule(
         in_channels=1,
         out_channels=1,
         base_features=32,
-        loss_fn=HybridSpectrogramLoss(sc_weight=1.0),
+        loss_fn=criterion,
         lr=1e-4,
     )
 

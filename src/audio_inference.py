@@ -25,7 +25,9 @@ class AudioRestorer:
         print(f"Loading model onto {self.device} from: {checkpoint_path}")
 
         # Load the U-Net model from the checkpoint
-        self.model = RestorationModule.load_from_checkpoint(checkpoint_path)
+        self.model = RestorationModule.load_from_checkpoint(
+            checkpoint_path, strict=False
+        )
         self.model.eval()
         self.model.to(self.device)
 

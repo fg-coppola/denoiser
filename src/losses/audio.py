@@ -1,52 +1,158 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-class SpectralConvergenceLoss(nn.Module):
+class CompositeSpectrogramLoss(nn.Module):
     """
-    Calculates the Spectral Convergence loss.
-    It penalizes structural differences between the target and predicted linear magnitudes.
-    This helps significantly in reducing 'metallic' or 'robotic' artifacts by forcing
-    the network to maintain continuous harmonic structures.
+    Generic restoration loss.
+
+    L =
+        λ_l1     * L1
+      + λ_sobel * Sobel Gradient Loss
+      + λ_sc    * Spectral Convergence
+
+    Compatible with any tensor of shape:
+
+        (B, C, H, W)
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        lambda_l1: float = 1.0,
+        lambda_sobel: float = 0.2,
+        lambda_sc: float = 0.1,
+        eps: float = 1e-8,
+    ):
         super().__init__()
 
-    def forward(self, x_mag: torch.Tensor, y_mag: torch.Tensor) -> torch.Tensor:
-        # Calculate Frobenius norm over the spatial dimensions (Frequency and Time)
-        # dim=(-2, -1) ensures we calculate the norm for each 2D spectrogram in the batch independently
-        num = torch.linalg.matrix_norm(y_mag - x_mag, ord="fro", dim=(-2, -1))
-        den = torch.linalg.matrix_norm(y_mag, ord="fro", dim=(-2, -1))
+        self.lambda_l1 = lambda_l1
+        self.lambda_sobel = lambda_sobel
+        self.lambda_sc = lambda_sc
+        self.eps = eps
 
-        # Divide and average across the batch (added epsilon to prevent division by zero)
-        return (num / (den + 1e-7)).mean()
+        sobel_x = torch.tensor(
+            [
+                [-1.0, 0.0, 1.0],
+                [-2.0, 0.0, 2.0],
+                [-1.0, 0.0, 1.0],
+            ],
+            dtype=torch.float32,
+        )
 
+        sobel_y = torch.tensor(
+            [
+                [-1.0, -2.0, -1.0],
+                [0.0, 0.0, 0.0],
+                [1.0, 2.0, 1.0],
+            ],
+            dtype=torch.float32,
+        )
 
-class HybridSpectrogramLoss(nn.Module):
-    """
-    A hybrid loss function combining standard L1 Loss (on log magnitudes)
-    with Spectral Convergence Loss (on linear magnitudes).
-    """
+        self.register_buffer(
+            "sobel_x",
+            sobel_x.view(1, 1, 3, 3),
+        )
 
-    def __init__(self, sc_weight: float = 1.0):
-        super().__init__()
-        self.l1_loss = nn.L1Loss()
-        self.sc_loss = SpectralConvergenceLoss()
+        self.register_buffer(
+            "sobel_y",
+            sobel_y.view(1, 1, 3, 3),
+        )
 
-        # The weight balancing the two losses. 1.0 is a robust starting point.
-        self.sc_weight = sc_weight
+    def _sobel(self, x):
 
-    def forward(self, pred_log: torch.Tensor, target_log: torch.Tensor) -> torch.Tensor:
-        # 1. Standard L1 loss on the log-scaled spectrograms (Great for denoising details)
-        l1 = self.l1_loss(pred_log, target_log)
+        channels = x.shape[1]
 
-        # 2. Convert log-scaled spectrograms back to linear scale for SC loss
-        pred_linear = torch.expm1(pred_log)
-        target_linear = torch.expm1(target_log)
+        kernel_x = self.sobel_x.repeat(channels, 1, 1, 1)
+        kernel_y = self.sobel_y.repeat(channels, 1, 1, 1)
 
-        # 3. Calculate Spectral Convergence on linear magnitudes (Great for harmonic structure)
-        sc = self.sc_loss(pred_linear, target_linear)
+        grad_x = F.conv2d(
+            x,
+            kernel_x,
+            padding=1,
+            groups=channels,
+        )
 
-        # 4. Combine them
-        return l1 + (self.sc_weight * sc)
+        grad_y = F.conv2d(
+            x,
+            kernel_y,
+            padding=1,
+            groups=channels,
+        )
+
+        return grad_x, grad_y
+
+    def sobel_loss(self, prediction, target):
+
+        pred_gx, pred_gy = self._sobel(prediction)
+        tgt_gx, tgt_gy = self._sobel(target)
+
+        loss_x = F.l1_loss(pred_gx, tgt_gx)
+        loss_y = F.l1_loss(pred_gy, tgt_gy)
+
+        return loss_x + loss_y
+
+    def spectral_convergence_loss(
+        self,
+        prediction,
+        target,
+    ):
+        """
+        Computed independently for each sample in the batch,
+        then averaged.
+
+        Supports arbitrary channel count.
+        """
+
+        diff = target - prediction
+
+        diff = diff.flatten(start_dim=1)
+        target = target.flatten(start_dim=1)
+
+        numerator = torch.linalg.norm(
+            diff,
+            dim=1,
+        )
+
+        denominator = torch.linalg.norm(
+            target,
+            dim=1,
+        )
+
+        sc = numerator / (denominator + self.eps)
+
+        return sc.mean()
+
+    def forward(
+        self,
+        prediction,
+        target,
+        return_components: bool = False,
+    ):
+
+        l1 = F.l1_loss(
+            prediction,
+            target,
+        )
+
+        sobel = self.sobel_loss(
+            prediction,
+            target,
+        )
+
+        sc = self.spectral_convergence_loss(
+            prediction,
+            target,
+        )
+
+        total = self.lambda_l1 * l1 + self.lambda_sobel * sobel + self.lambda_sc * sc
+
+        if return_components:
+            return total, {
+                "total": total.detach(),
+                "l1": l1.detach(),
+                "sobel": sobel.detach(),
+                "spectral_convergence": sc.detach(),
+            }
+
+        return total
