@@ -140,9 +140,14 @@ class CompositeSpectrogramLoss(nn.Module):
             target,
         )
 
+        # Spectral Convergence must be calculated on linear scale
+        # We use torch.clamp to prevent mathematical explosions during expm1
+        pred_linear = torch.expm1(torch.clamp(prediction, max=20.0))
+        tgt_linear = torch.expm1(torch.clamp(target, max=20.0))
+
         sc = self.spectral_convergence_loss(
-            prediction,
-            target,
+            pred_linear,
+            tgt_linear,
         )
 
         total = self.lambda_l1 * l1 + self.lambda_sobel * sobel + self.lambda_sc * sc
