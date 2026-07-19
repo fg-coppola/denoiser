@@ -202,15 +202,34 @@ class RestorationModule(L.LightningModule):
                 comparison_tensor, nrow=3, normalize=True
             )
 
-            # Add the image grid to TensorBoard
-            # global_step acts as the X-axis in the dashboard slider
-            self.logger.experiment.add_image(
-                "Validation: 1.Noisy | 2.Reconstructed | 3.Clean",
-                grid,
-                global_step=self.global_step,
-            )
+            # We save this grid to a class variable so that it can be logged in the on_validation_epoch_end hook
+            # This allows us to log the new image only if there is an improvement in validation loss
+            self._val_image_cache = grid
 
         return loss
+
+    def on_validation_epoch_end(self):
+        current_val_loss = self.trainer.callback_metrics.get("val_loss")
+
+        if current_val_loss is not None:
+            current_val_loss = current_val_loss.item()
+
+            if not hasattr(self, "best_val_loss"):
+                self.best_val_loss = float("inf")
+
+            if current_val_loss < self.best_val_loss:
+                self.best_val_loss = current_val_loss
+
+                if (
+                    hasattr(self, "_val_image_cache")
+                    and self._val_image_cache is not None
+                ):
+                    self.logger.experiment.add_image(
+                        "Validation: 1.Noisy | 2.Reconstructed | 3.Clean",
+                        self._val_image_cache,
+                        global_step=self.global_step,
+                    )
+                    self._val_image_cache = None
 
     def configure_optimizers(self):
         # Standard Adam optimizer for general convergence stability
