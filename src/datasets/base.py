@@ -3,11 +3,14 @@ from torch.utils.data import DataLoader
 
 
 class BaseDataModule(L.LightningDataModule):
-    def __init__(self, batch_size=32, num_workers=4, persistent_workers=False):
+    def __init__(
+        self, batch_size=32, num_workers=4, persistent_workers=False, pin_memory=False
+    ):
         super().__init__()
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.persistent_workers = persistent_workers
+        self.pin_memory = pin_memory
 
     def train_dataloader(self):
         return DataLoader(
@@ -16,6 +19,7 @@ class BaseDataModule(L.LightningDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             persistent_workers=self.persistent_workers,
+            pin_memory=self.pin_memory,
         )
 
     def val_dataloader(self):
@@ -25,4 +29,5 @@ class BaseDataModule(L.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             persistent_workers=self.persistent_workers,
+            pin_memory=self.pin_memory,
         )

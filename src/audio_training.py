@@ -55,6 +55,7 @@ def main(
         batch_size=batch_size,
         num_workers=4,
         persistent_workers=True,
+        pin_memory=True,
     )
 
     early_stop_callback = EarlyStopping(
