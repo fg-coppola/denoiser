@@ -5,159 +5,113 @@ import torch.nn.functional as F
 
 class CompositeSpectrogramLoss(nn.Module):
     """
-    Generic restoration loss.
-
-    L =
-        λ_l1     * L1
-      + λ_sobel * Sobel Gradient Loss
-      + λ_sc    * Spectral Convergence
-
-    Compatible with any tensor of shape:
-
-        (B, C, H, W)
+    Composite loss function combining Asymmetric L1, Sobel edge detection,
+    and Spectral Convergence.
     """
 
     def __init__(
         self,
-        lambda_l1: float = 1.0,
-        lambda_sobel: float = 0.2,
-        lambda_sc: float = 0.1,
-        eps: float = 1e-8,
+        l1_weight: float = 1.0,
+        sobel_weight: float = 0.5,
+        sc_weight: float = 0.5,
+        asymmetry_penalty: float = 2.5,
     ):
         super().__init__()
+        self.l1_weight = l1_weight
+        self.sobel_weight = sobel_weight
+        self.sc_weight = sc_weight
+        self.asymmetry_penalty = asymmetry_penalty
 
-        self.lambda_l1 = lambda_l1
-        self.lambda_sobel = lambda_sobel
-        self.lambda_sc = lambda_sc
-        self.eps = eps
-
+        # Define Sobel kernels for edge detection (X and Y directions)
         sobel_x = torch.tensor(
-            [
-                [-1.0, 0.0, 1.0],
-                [-2.0, 0.0, 2.0],
-                [-1.0, 0.0, 1.0],
-            ],
-            dtype=torch.float32,
+            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32
         )
-
         sobel_y = torch.tensor(
-            [
-                [-1.0, -2.0, -1.0],
-                [0.0, 0.0, 0.0],
-                [1.0, 2.0, 1.0],
-            ],
-            dtype=torch.float32,
+            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32
         )
 
-        self.register_buffer(
-            "sobel_x",
-            sobel_x.view(1, 1, 3, 3),
+        # Reshape for F.conv2d (out_channels, in_channels, kernel_height, kernel_width)
+        self.register_buffer("sobel_x", sobel_x.view(1, 1, 3, 3))
+        self.register_buffer("sobel_y", sobel_y.view(1, 1, 3, 3))
+
+    def _asymmetric_l1(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Penalizes under-estimation (cutting speech) more than over-estimation (leaving noise)."""
+        diff = pred - target
+        abs_diff = torch.abs(diff)
+
+        # Create a mask where prediction is lower than target
+        under_estimation = (diff < 0).float()
+
+        # Apply the penalty weight to the under-estimated pixels
+        weighted_diff = abs_diff * (
+            1.0 + (self.asymmetry_penalty - 1.0) * under_estimation
         )
+        return weighted_diff.mean()
 
-        self.register_buffer(
-            "sobel_y",
-            sobel_y.view(1, 1, 3, 3),
-        )
+    def _sobel_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Computes L1 loss on the spatial gradients (edges) of the spectrograms."""
+        # Pad inputs to keep spatial dimensions same after convolution
+        pred_pad = F.pad(pred, (1, 1, 1, 1), mode="replicate")
+        target_pad = F.pad(target, (1, 1, 1, 1), mode="replicate")
 
-    def _sobel(self, x):
+        # Apply Sobel filters
+        pred_grad_x = F.conv2d(pred_pad, self.sobel_x)
+        pred_grad_y = F.conv2d(pred_pad, self.sobel_y)
 
-        channels = x.shape[1]
+        target_grad_x = F.conv2d(target_pad, self.sobel_x)
+        target_grad_y = F.conv2d(target_pad, self.sobel_y)
 
-        kernel_x = self.sobel_x.repeat(channels, 1, 1, 1)
-        kernel_y = self.sobel_y.repeat(channels, 1, 1, 1)
-
-        grad_x = F.conv2d(
-            x,
-            kernel_x,
-            padding=1,
-            groups=channels,
-        )
-
-        grad_y = F.conv2d(
-            x,
-            kernel_y,
-            padding=1,
-            groups=channels,
-        )
-
-        return grad_x, grad_y
-
-    def sobel_loss(self, prediction, target):
-
-        pred_gx, pred_gy = self._sobel(prediction)
-        tgt_gx, tgt_gy = self._sobel(target)
-
-        loss_x = F.l1_loss(pred_gx, tgt_gx)
-        loss_y = F.l1_loss(pred_gy, tgt_gy)
+        # Calculate L1 loss on the gradients
+        loss_x = F.l1_loss(pred_grad_x, target_grad_x)
+        loss_y = F.l1_loss(pred_grad_y, target_grad_y)
 
         return loss_x + loss_y
 
-    def spectral_convergence_loss(
-        self,
-        prediction,
-        target,
-    ):
+    def _spectral_convergence(
+        self, pred_log_spec: torch.Tensor, target_log_spec: torch.Tensor
+    ) -> torch.Tensor:
         """
-        Computed independently for each sample in the batch,
-        then averaged.
-
-        Supports arbitrary channel count.
+        Calculates Spectral Convergence in the linear magnitude domain.
+        Converts log-spectrograms back to linear scale before computing the Frobenius norm.
         """
+        # 1. Convert back to linear magnitude scale
+        pred_linear_mag = torch.expm1(pred_log_spec)
+        target_linear_mag = torch.expm1(target_log_spec)
 
-        diff = target - prediction
+        # 2. Compute the Frobenius norm on the linear magnitudes
+        norm_diff = torch.norm(target_linear_mag - pred_linear_mag, p="fro")
+        norm_target = torch.norm(target_linear_mag, p="fro")
 
-        diff = diff.flatten(start_dim=1)
-        target = target.flatten(start_dim=1)
-
-        numerator = torch.linalg.norm(
-            diff,
-            dim=1,
-        )
-
-        denominator = torch.linalg.norm(
-            target,
-            dim=1,
-        )
-
-        sc = numerator / (denominator + self.eps)
-
-        return sc.mean()
+        # 3. Add a small epsilon to prevent division by zero
+        return norm_diff / (norm_target + 1e-8)
 
     def forward(
-        self,
-        prediction,
-        target,
-        return_components: bool = False,
-    ):
+        self, pred_log_spec: torch.Tensor, target_log_spec: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        # Ensure tensors have shape (Batch, Channels, Height, Width) for F.conv2d
+        if pred_log_spec.dim() == 3:
+            pred_log_spec = pred_log_spec.unsqueeze(1)
+            target_log_spec = target_log_spec.unsqueeze(1)
 
-        l1 = F.l1_loss(
-            prediction,
-            target,
-        )
+        # 1. Calculate raw losses
+        l1_raw = self._asymmetric_l1(pred_log_spec, target_log_spec)
+        sobel_raw = self._sobel_loss(pred_log_spec, target_log_spec)
+        sc_raw = self._spectral_convergence(pred_log_spec, target_log_spec)
 
-        sobel = self.sobel_loss(
-            prediction,
-            target,
-        )
+        # 2. Apply weights
+        weighted_l1 = self.l1_weight * l1_raw
+        weighted_sobel = self.sobel_weight * sobel_raw
+        weighted_sc = self.sc_weight * sc_raw
 
-        # Spectral Convergence must be calculated on linear scale
-        # We use torch.clamp to prevent mathematical explosions during expm1
-        pred_linear = torch.expm1(torch.clamp(prediction, max=20.0))
-        tgt_linear = torch.expm1(torch.clamp(target, max=20.0))
+        # 3. Compute total loss
+        total_loss = weighted_l1 + weighted_sobel + weighted_sc
 
-        sc = self.spectral_convergence_loss(
-            pred_linear,
-            tgt_linear,
-        )
+        # 4. Create a dictionary of the weighted components for logging
+        # Using the "loss/" prefix helps group them nicely in W&B and TensorBoard
+        loss_components = {
+            "loss/l1_asymmetric": weighted_l1,
+            "loss/sobel": weighted_sobel,
+            "loss/spectral_convergence": weighted_sc,
+        }
 
-        total = self.lambda_l1 * l1 + self.lambda_sobel * sobel + self.lambda_sc * sc
-
-        if return_components:
-            return total, {
-                "total": total.detach(),
-                "l1": l1.detach(),
-                "sobel": sobel.detach(),
-                "spectral_convergence": sc.detach(),
-            }
-
-        return total
+        return total_loss, loss_components
