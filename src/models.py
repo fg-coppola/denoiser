@@ -181,6 +181,37 @@ class UNet(nn.Module):
         return logits
 
 
+class ResidualMaskingDenoiser(nn.Module):
+    """
+    A denoiser that uses a base model to predict a late reverberation mask,
+    which is then subtracted from the noisy input to recover the clean signal.
+    """
+
+    def __init__(self, base_model: nn.Module):
+        super().__init__()
+        self.base_model = base_model
+
+    def forward(self, noisy_log_spec: torch.Tensor) -> torch.Tensor:
+        # 1. Base model predicts the mask logits for LATE REVERBERATION
+        raw_mask_logits = self.base_model(noisy_log_spec)
+        late_rev_mask = torch.sigmoid(raw_mask_logits)
+
+        # 2. Transform the noisy input from log scale to linear magnitude scale
+        noisy_mag = torch.expm1(noisy_log_spec)
+
+        # 3. Estimate the reverberation energy
+        reverb_estimation = noisy_mag * late_rev_mask
+
+        # 4. Subtract the reverberation from the noisy signal.
+        # Using ReLU to prevent non-physical negative energy values.
+        clean_mag = torch.relu(noisy_mag - reverb_estimation)
+
+        # 5. Return the clean signal back to log scale
+        clean_log_spec = torch.log1p(clean_mag)
+
+        return clean_log_spec
+
+
 class RestorationModule(L.LightningModule):
     """
     LightningModule wrapper for training the U-Net on signal restoration tasks.
