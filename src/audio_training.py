@@ -34,9 +34,7 @@ def main(
     logger = TensorBoardLogger(save_dir=logs_dir, name=experiment_name)
 
     criterion = CompositeSpectrogramLoss(
-        lambda_l1=1.0,
-        lambda_sobel=0.2,
-        lambda_sc=0.1,
+        l1_weight=1.0, sobel_weight=0.15, sc_weight=0.5, asymmetry_penalty=2.5
     )
     rir_model = RestorationModule(
         in_channels=1,
