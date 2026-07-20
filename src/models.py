@@ -1,3 +1,5 @@
+from typing import Tuple, Union
+
 import pytorch_lightning as L
 import torch
 import torch.nn as nn
@@ -10,15 +12,43 @@ class DoubleConv(nn.Module):
     """
     A block consisting of two convolutional layers, each followed by
     Batch Normalization and a LeakyReLU activation function.
+    Supports asymmetric kernels (e.g., (5, 3)) for audio spectrograms.
     """
 
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: Union[int, Tuple[int, int]] = 3,
+    ):
         super().__init__()
+
+        # Convert integer kernel to tuple for uniform handling
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size)
+
+        # Dynamic padding to maintain spatial dimensions: (k - 1) // 2
+        pad_h = (kernel_size[0] - 1) // 2
+        pad_w = (kernel_size[1] - 1) // 2
+        padding = (pad_h, pad_w)
+
         self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                padding=padding,
+                bias=False,
+            ),
             nn.BatchNorm2d(out_channels),
             nn.LeakyReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                padding=padding,
+                bias=False,
+            ),
             nn.BatchNorm2d(out_channels),
             nn.LeakyReLU(inplace=True),
         )
@@ -32,10 +62,15 @@ class DownBlock(nn.Module):
     Downscaling block using MaxPool2d followed by a DoubleConv block.
     """
 
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: Union[int, Tuple[int, int]] = 3,
+    ):
         super().__init__()
         self.maxpool_conv = nn.Sequential(
-            nn.MaxPool2d(2), DoubleConv(in_channels, out_channels)
+            nn.MaxPool2d(2), DoubleConv(in_channels, out_channels, kernel_size)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -48,17 +83,23 @@ class UpBlock(nn.Module):
     followed by a DoubleConv block, properly handling skip connection concatenation.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, bilinear: bool = False):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        bilinear: bool = False,
+        kernel_size: Union[int, Tuple[int, int]] = 3,
+    ):
         super().__init__()
         # If bilinear, use standard upsample and halve the input channels of Conv
         if bilinear:
             self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
-            self.conv = DoubleConv(in_channels, out_channels)
+            self.conv = DoubleConv(in_channels, out_channels, kernel_size)
         else:
             self.up = nn.ConvTranspose2d(
                 in_channels, in_channels // 2, kernel_size=2, stride=2
             )
-            self.conv = DoubleConv(in_channels, out_channels)
+            self.conv = DoubleConv(in_channels, out_channels, kernel_size)
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         # Upscale the input feature map
@@ -80,7 +121,8 @@ class UpBlock(nn.Module):
 
 class UNet(nn.Module):
     """
-    Fully Convolutional U-Net supporting variable input and output channels.
+    Fully Convolutional U-Net supporting variable input/output channels
+    and asymmetric kernels for spectrogram processing.
     """
 
     def __init__(
@@ -89,6 +131,7 @@ class UNet(nn.Module):
         out_channels: int,
         base_features: int = 64,
         bilinear: bool = False,
+        kernel_size: Union[int, Tuple[int, int]] = 3,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -96,33 +139,39 @@ class UNet(nn.Module):
         self.bilinear = bilinear
 
         # Contracting Path (Encoder)
-        self.inc = DoubleConv(in_channels, base_features)
-        self.down1 = DownBlock(base_features, base_features * 2)
-        self.down2 = DownBlock(base_features * 2, base_features * 4)
-        self.down3 = DownBlock(base_features * 4, base_features * 8)
+        self.inc = DoubleConv(in_channels, base_features, kernel_size)
+        self.down1 = DownBlock(base_features, base_features * 2, kernel_size)
+        self.down2 = DownBlock(base_features * 2, base_features * 4, kernel_size)
+        self.down3 = DownBlock(base_features * 4, base_features * 8, kernel_size)
 
         # Determine channel scale factor depending on upscaling method
         factor = 2 if bilinear else 1
-        self.down4 = DownBlock(base_features * 8, (base_features * 16) // factor)
+        self.down4 = DownBlock(
+            base_features * 8, (base_features * 16) // factor, kernel_size
+        )
 
         # Expansive Path (Decoder)
-        self.up1 = UpBlock(base_features * 16, (base_features * 8) // factor, bilinear)
-        self.up2 = UpBlock(base_features * 8, (base_features * 4) // factor, bilinear)
-        self.up3 = UpBlock(base_features * 4, (base_features * 2) // factor, bilinear)
-        self.up4 = UpBlock(base_features * 2, base_features, bilinear)
+        self.up1 = UpBlock(
+            base_features * 16, (base_features * 8) // factor, bilinear, kernel_size
+        )
+        self.up2 = UpBlock(
+            base_features * 8, (base_features * 4) // factor, bilinear, kernel_size
+        )
+        self.up3 = UpBlock(
+            base_features * 4, (base_features * 2) // factor, bilinear, kernel_size
+        )
+        self.up4 = UpBlock(base_features * 2, base_features, bilinear, kernel_size)
 
         # Output Projection Layer (1x1 convolution)
         self.outc = nn.Conv2d(base_features, out_channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Encoder passes and saving skip connections
         x1 = self.inc(x)
         x2 = self.down1(x1)
         x3 = self.down2(x2)
         x4 = self.down3(x3)
         x5 = self.down4(x4)
 
-        # Decoder passes utilizing saved skip connections
         x = self.up1(x5, x4)
         x = self.up2(x, x3)
         x = self.up3(x, x2)
