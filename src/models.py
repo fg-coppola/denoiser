@@ -219,7 +219,24 @@ class RestorationModule(L.LightningModule):
         noisy, clean = batch
         reconstructed = self(noisy)
 
-        loss = self.criterion(reconstructed, clean)
+        # Handle both standard losses (single tensor) and composite losses (tuple of tensor and dict)
+        criterion_output = self.criterion(reconstructed, clean)
+
+        if isinstance(criterion_output, tuple):
+            loss, loss_components = criterion_output
+            # Log individual loss components
+            for component_name, component_value in loss_components.items():
+                self.log(
+                    f"train_{component_name}",
+                    component_value,
+                    on_step=True,
+                    on_epoch=False,
+                    prog_bar=False,
+                    logger=True,
+                )
+        else:
+            loss = criterion_output
+
         self.log(
             "train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True
         )
@@ -229,7 +246,24 @@ class RestorationModule(L.LightningModule):
         noisy, clean = batch
         reconstructed = self(noisy)
 
-        loss = self.criterion(reconstructed, clean)
+        # Handle both standard losses (single tensor) and composite losses (tuple of tensor and dict)
+        criterion_output = self.criterion(reconstructed, clean)
+
+        if isinstance(criterion_output, tuple):
+            loss, loss_components = criterion_output
+            # Log individual loss components for validation
+            for component_name, component_value in loss_components.items():
+                self.log(
+                    f"val_{component_name}",
+                    component_value,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    logger=True,
+                )
+        else:
+            loss = criterion_output
+
         self.log("val_loss", loss, on_epoch=True, prog_bar=True, logger=True)
 
         # Log images only for the very first batch of validation
