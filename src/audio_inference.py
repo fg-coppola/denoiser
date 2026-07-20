@@ -1,7 +1,8 @@
 import argparse
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 import torchaudio
@@ -13,9 +14,8 @@ from models import RestorationModule
 
 class AudioRestorer:
     """
-    A class dedicated to restoring noisy audio using a trained U-Net model.
-    It utilizes the 'Noisy Phase' trick to prevent metallic/robotic artifacts
-    typically introduced by Griffin-Lim estimation.
+    A class dedicated to restoring noisy audio using a trained U-Net model,
+    with built-in support for saving spectrogram comparison plots.
     """
 
     def __init__(self, checkpoint_path: str, device: str = None):
@@ -24,7 +24,6 @@ class AudioRestorer:
         )
         print(f"Loading model onto {self.device} from: {checkpoint_path}")
 
-        # Load the U-Net model from the checkpoint
         self.model = RestorationModule.load_from_checkpoint(
             checkpoint_path, strict=False
         )
@@ -37,46 +36,81 @@ class AudioRestorer:
         self.win_length = 1024
         self.sample_rate = 16000
 
-        # Pre-compute the Hann window and send it to the correct device
         self.window = torch.hann_window(self.win_length).to(self.device)
 
     def _pad_for_unet(self, log_spec: torch.Tensor) -> Tuple[torch.Tensor, int]:
-        """
-        Pads the time dimension to ensure it's a multiple of 16.
-        This is required because the U-Net uses 4 levels of Max Pooling (2^4 = 16).
-        """
         time_frames = log_spec.shape[-1]
         pad_amount = (16 - (time_frames % 16)) % 16
 
         if pad_amount > 0:
-            # Pad the right side of the last dimension
             log_spec = F.pad(log_spec, (0, pad_amount))
 
         return log_spec, pad_amount
 
-    def restore_audio(self, input_path: str, output_path: str):
-        """
-        Processes a single audio file through the full pipeline:
-        Load -> Resample -> STFT -> U-Net -> ISTFT -> Save.
-        """
-        print(f"\nProcessing file: {input_path}")
+    def _load_and_resample(self, file_path: str) -> torch.Tensor:
+        """Helper method to load an audio file and format it for STFT."""
+        waveform, sr = torchaudio.load(file_path)
 
-        # 1. Load and prepare the audio waveform
-        waveform, sr = torchaudio.load(input_path)
-
-        # Convert to mono if necessary
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
 
-        # Resample to target sample rate (16 kHz)
         if sr != self.sample_rate:
             resampler = T.Resample(orig_freq=sr, new_freq=self.sample_rate)
             waveform = resampler(waveform)
 
-        original_length = waveform.shape[-1]
-        waveform = waveform.to(self.device)
+        return waveform.to(self.device)
 
-        # 2. Extract Complex STFT (Magnitude & Phase)
+    def _save_spectrogram_plot(
+        self,
+        noisy_spec: torch.Tensor,
+        restored_spec: torch.Tensor,
+        output_path: str,
+        reference_spec: Optional[torch.Tensor] = None,
+    ):
+        """Generates and saves a side-by-side comparison image of the log spectrograms."""
+        num_plots = 3 if reference_spec is not None else 2
+        fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 5))
+
+        # Convert tensors to 2D numpy arrays for Matplotlib
+        noisy_np = noisy_spec.cpu().numpy()
+        restored_np = restored_spec.cpu().numpy()
+
+        # Plot Noisy
+        axes[0].imshow(noisy_np, aspect="auto", origin="lower", cmap="magma")
+        axes[0].set_title("Noisy Input")
+        axes[0].set_xlabel("Frames")
+        axes[0].set_ylabel("Frequency Bins")
+
+        # Plot Restored
+        axes[1].imshow(restored_np, aspect="auto", origin="lower", cmap="magma")
+        axes[1].set_title("Restored Output")
+        axes[1].set_xlabel("Frames")
+
+        # Plot Reference if available
+        if reference_spec is not None:
+            ref_np = reference_spec.cpu().numpy()
+            axes[2].imshow(ref_np, aspect="auto", origin="lower", cmap="magma")
+            axes[2].set_title("Clean Reference (Target)")
+            axes[2].set_xlabel("Frames")
+
+        plt.tight_layout()
+
+        # Save image with same name as audio output but .png extension
+        img_path = Path(output_path).with_suffix(".png")
+        plt.savefig(str(img_path), dpi=150)
+        plt.close(fig)
+        print(f"Spectrogram comparison saved to: {img_path.absolute()}")
+
+    def restore_audio(
+        self, input_path: str, output_path: str, reference_path: str = None
+    ):
+        print(f"\nProcessing file: {input_path}")
+
+        # 1. Load noisy waveform
+        waveform = self._load_and_resample(input_path)
+        original_length = waveform.shape[-1]
+
+        # 2. Extract Complex STFT
         print("Extracting Phase and Magnitude...")
         stft_complex = torch.stft(
             waveform,
@@ -92,11 +126,9 @@ class AudioRestorer:
         noisy_phase = torch.angle(stft_complex)
 
         # 3. Pre-process for the U-Net
-        log_spec = torch.log1p(magnitude)
-        log_spec, pad_amount = self._pad_for_unet(log_spec)
-
-        # Add a batch dimension: [1, Channels, Freq, Time]
-        input_tensor = log_spec.unsqueeze(0)
+        noisy_log_spec = torch.log1p(magnitude)
+        padded_log_spec, pad_amount = self._pad_for_unet(noisy_log_spec)
+        input_tensor = padded_log_spec.unsqueeze(0)
 
         # 4. Neural Network Inference
         print("Enhancing Magnitude using U-Net...")
@@ -104,21 +136,44 @@ class AudioRestorer:
             output_log_spec = self.model(input_tensor)
 
         # 5. Post-process U-Net output
-        # Remove batch dimension
         output_log_spec = output_log_spec.squeeze(0)
 
-        # Remove the padding added earlier
         if pad_amount > 0:
             output_log_spec = output_log_spec[..., :-pad_amount]
 
-        # Reverse the logarithmic scaling
-        clean_magnitude = torch.expm1(output_log_spec)
+        # 6. Generate Comparison Plot
+        # We process the reference file if provided to get its log spectrogram
+        ref_log_spec = None
+        if reference_path:
+            print(f"Loading reference clean audio: {reference_path}")
+            ref_waveform = self._load_and_resample(reference_path)
 
-        # 6. Reconstruct the Audio
+            ref_stft = torch.stft(
+                ref_waveform,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+                window=self.window,
+                center=True,
+                return_complex=True,
+            )
+            ref_log_spec = torch.log1p(torch.abs(ref_stft))
+
+        print("Generating spectrogram plot...")
+        self._save_spectrogram_plot(
+            noisy_spec=noisy_log_spec.squeeze(0),
+            restored_spec=output_log_spec.squeeze(0),
+            output_path=output_path,
+            reference_spec=ref_log_spec.squeeze(0)
+            if ref_log_spec is not None
+            else None,
+        )
+
+        # 7. Reconstruct the Audio
+        clean_magnitude = torch.expm1(output_log_spec)
         print("Reconstructing waveform (Inverse STFT)...")
         reconstructed_complex = torch.polar(clean_magnitude, noisy_phase)
 
-        # The 'length' parameter ensures the output matches the original waveform exactly
         reconstructed_waveform = torch.istft(
             reconstructed_complex,
             n_fft=self.n_fft,
@@ -129,7 +184,7 @@ class AudioRestorer:
             length=original_length,
         )
 
-        # 7. Save the final cleaned audio
+        # 8. Save the final cleaned audio
         reconstructed_waveform = reconstructed_waveform.cpu()
 
         out_file = Path(output_path)
@@ -160,9 +215,16 @@ if __name__ == "__main__":
         default="cleaned_output.wav",
         help="Path where the cleaned audio will be saved",
     )
+    parser.add_argument(
+        "--reference",
+        type=str,
+        default=None,
+        help="[Optional] Path to the clean ground-truth audio to generate a 3-way spectrogram comparison plot",
+    )
 
     args = parser.parse_args()
 
-    # Initialize the restorer class and process the file
     restorer = AudioRestorer(checkpoint_path=args.ckpt)
-    restorer.restore_audio(input_path=args.input, output_path=args.output)
+    restorer.restore_audio(
+        input_path=args.input, output_path=args.output, reference_path=args.reference
+    )
