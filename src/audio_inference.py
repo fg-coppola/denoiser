@@ -8,8 +8,7 @@ import torch.nn.functional as F
 import torchaudio
 import torchaudio.transforms as T
 
-# Adjust this import based on your actual project structure
-from models import RestorationModule
+from models import RestorationModule, UNet
 
 
 class AudioRestorer:
@@ -18,14 +17,24 @@ class AudioRestorer:
     with built-in support for saving spectrogram comparison plots.
     """
 
-    def __init__(self, checkpoint_path: str, device: str = None):
+    def __init__(
+        self, checkpoint_path: str, device: str = None, base_features: int = 32
+    ):
         self.device = torch.device(
             device if device else ("cuda" if torch.cuda.is_available() else "cpu")
         )
         print(f"Loading model onto {self.device} from: {checkpoint_path}")
 
+        # Initialize the model architecture
+        unet = UNet(
+            in_channels=1,
+            out_channels=1,
+            base_features=base_features,
+            kernel_size=(11, 5),
+        )
+
         self.model = RestorationModule.load_from_checkpoint(
-            checkpoint_path, strict=False
+            checkpoint_path, denoiser=unet, strict=False
         )
         self.model.eval()
         self.model.to(self.device)
@@ -221,10 +230,18 @@ if __name__ == "__main__":
         default=None,
         help="[Optional] Path to the clean ground-truth audio to generate a 3-way spectrogram comparison plot",
     )
+    parser.add_argument(
+        "--base_features",
+        type=int,
+        default=32,
+        help="Number of base features for the U-Net model (must match training configuration)",
+    )
 
     args = parser.parse_args()
 
-    restorer = AudioRestorer(checkpoint_path=args.ckpt)
+    restorer = AudioRestorer(
+        checkpoint_path=args.ckpt, base_features=args.base_features
+    )
     restorer.restore_audio(
         input_path=args.input, output_path=args.output, reference_path=args.reference
     )

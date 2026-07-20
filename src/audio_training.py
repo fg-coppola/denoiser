@@ -9,7 +9,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 
 from datasets.voices import RIRDataModule
 from losses.audio import CompositeSpectrogramLoss
-from models import RestorationModule
+from models import RestorationModule, UNet
 
 
 def main(
@@ -36,10 +36,16 @@ def main(
     criterion = CompositeSpectrogramLoss(
         l1_weight=1.0, sobel_weight=0.15, sc_weight=0.5, asymmetry_penalty=2.5
     )
-    rir_model = RestorationModule(
+
+    unet = UNet(
         in_channels=1,
         out_channels=1,
         base_features=base_features,
+        kernel_size=(11, 5),  # Asymmetric kernel for audio spectrograms
+    )
+
+    rir_model = RestorationModule(
+        denoiser=unet,
         loss_fn=criterion,
         lr=1e-4,
     )

@@ -189,22 +189,14 @@ class RestorationModule(L.LightningModule):
 
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
-        base_features: int = 64,
+        denoiser: nn.Module,
         loss_fn=nn.L1Loss(),
         lr: float = 1e-4,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["loss_fn"])
+        self.save_hyperparameters(ignore=["loss_fn", "denoiser"])
 
-        # Instantiate the U-Net with parameters
-        self.model = UNet(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            base_features=base_features,
-        )
-
+        self.model = denoiser
         self.model = self.model.to(memory_format=torch.channels_last)
 
         # Use the provided loss function for training; default is L1 Loss
