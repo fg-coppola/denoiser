@@ -206,6 +206,117 @@ class AudioRestorer:
         )
         print(f"Success! Saved output audio to: {out_file.absolute()}\n")
 
+    def run_oracle_test(self, noisy_path: str, clean_path: str, output_dir: str):
+        """
+        Runs oracle tests to isolate whether audio artifacts are caused
+        by the model's magnitude prediction or the noisy phase reconstruction.
+        """
+        import os
+
+        print("\n--- Running Oracle Tests ---")
+
+        # 1. Load both aligned waveforms
+        noisy_waveform = self._load_and_resample(noisy_path)
+        clean_waveform = self._load_and_resample(clean_path)
+        original_length = noisy_waveform.shape[-1]
+
+        # 2. Extract STFT components for both
+        noisy_stft = torch.stft(
+            noisy_waveform,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=self.window,
+            center=True,
+            return_complex=True,
+        )
+        clean_stft = torch.stft(
+            clean_waveform,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=self.window,
+            center=True,
+            return_complex=True,
+        )
+
+        noisy_mag = torch.abs(noisy_stft)
+        noisy_phase = torch.angle(noisy_stft)
+
+        clean_mag = torch.abs(clean_stft)
+        clean_phase = torch.angle(clean_stft)
+
+        # 3. Get Model's Prediction
+        noisy_log_spec = torch.log1p(noisy_mag)
+        padded_log_spec, pad_amount = self._pad_for_unet(noisy_log_spec)
+
+        with torch.no_grad():
+            pred_log_spec = self.model(padded_log_spec.unsqueeze(0)).squeeze(0)
+
+        if pad_amount > 0:
+            pred_log_spec = pred_log_spec[..., :-pad_amount]
+
+        pred_mag = torch.expm1(pred_log_spec)
+
+        # 4. RECONSTRUCTION EXPERIMENTS
+
+        # Test A: The Phase Bottleneck (Clean Mag + Noisy Phase)
+        complex_a = torch.polar(clean_mag, noisy_phase)
+        audio_a = torch.istft(
+            complex_a,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=self.window,
+            center=True,
+            length=original_length,
+        )
+
+        # Test B: The Model's True Quality (Predicted Mag + Clean Phase)
+        complex_b = torch.polar(pred_mag, clean_phase)
+        audio_b = torch.istft(
+            complex_b,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=self.window,
+            center=True,
+            length=original_length,
+        )
+
+        # Test C: Current Reality (Predicted Mag + Noisy Phase)
+        complex_c = torch.polar(pred_mag, noisy_phase)
+        audio_c = torch.istft(
+            complex_c,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=self.window,
+            center=True,
+            length=original_length,
+        )
+
+        # 5. Save all variations for A/B testing
+        os.makedirs(output_dir, exist_ok=True)
+
+        torchaudio.save(
+            os.path.join(output_dir, "test_A_cleanMag_noisyPhase.wav"),
+            audio_a.cpu(),
+            self.sample_rate,
+        )
+        torchaudio.save(
+            os.path.join(output_dir, "test_B_predMag_cleanPhase.wav"),
+            audio_b.cpu(),
+            self.sample_rate,
+        )
+        torchaudio.save(
+            os.path.join(output_dir, "test_C_predMag_noisyPhase.wav"),
+            audio_c.cpu(),
+            self.sample_rate,
+        )
+
+        print(f"Oracle test files saved in: {output_dir}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="U-Net Audio Inference (Noisy Phase)")
@@ -244,4 +355,9 @@ if __name__ == "__main__":
     )
     restorer.restore_audio(
         input_path=args.input, output_path=args.output, reference_path=args.reference
+    )
+    restorer.run_oracle_test(
+        noisy_path=args.input,
+        clean_path=args.reference if args.reference else args.input,
+        output_dir=Path(args.output).parent / "oracle_tests",
     )
