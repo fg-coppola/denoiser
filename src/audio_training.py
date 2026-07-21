@@ -34,7 +34,7 @@ def main(
     logger = TensorBoardLogger(save_dir=logs_dir, name=experiment_name)
 
     criterion = CompositeSpectrogramLoss(
-        l1_weight=1.0, sobel_weight=0.15, sc_weight=0.5, asymmetry_penalty=2.5
+        l1_weight=1.0, sobel_weight=1.0, asymmetry_penalty=3.0
     )
 
     unet = UNet(

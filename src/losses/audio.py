@@ -5,21 +5,19 @@ import torch.nn.functional as F
 
 class CompositeSpectrogramLoss(nn.Module):
     """
-    Composite loss function combining Asymmetric L1, Sobel edge detection,
-    and Spectral Convergence.
+    Composite loss function tailored for log-spectrogram prediction.
+    Uses Asymmetric L1 for magnitude alignment and Sobel for edge/formant preservation.
     """
 
     def __init__(
         self,
         l1_weight: float = 1.0,
         sobel_weight: float = 0.5,
-        sc_weight: float = 0.5,
         asymmetry_penalty: float = 2.5,
     ):
         super().__init__()
         self.l1_weight = l1_weight
         self.sobel_weight = sobel_weight
-        self.sc_weight = sc_weight
         self.asymmetry_penalty = asymmetry_penalty
 
         # Define Sobel kernels for edge detection (X and Y directions)
@@ -35,7 +33,10 @@ class CompositeSpectrogramLoss(nn.Module):
         self.register_buffer("sobel_y", sobel_y.view(1, 1, 3, 3))
 
     def _asymmetric_l1(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Penalizes under-estimation (cutting speech) more than over-estimation (leaving noise)."""
+        """
+        Calculates Log STFT Magnitude Loss with asymmetric penalization.
+        Operates securely in the log domain.
+        """
         diff = pred - target
         abs_diff = torch.abs(diff)
 
@@ -49,7 +50,10 @@ class CompositeSpectrogramLoss(nn.Module):
         return weighted_diff.mean()
 
     def _sobel_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Computes L1 loss on the spatial gradients (edges) of the spectrograms."""
+        """
+        Computes L1 loss on the spatial gradients (edges) of the log-spectrograms.
+        Crucial for preserving harmonic lines and high-frequency transients.
+        """
         # Pad inputs to keep spatial dimensions same after convolution
         pred_pad = F.pad(pred, (1, 1, 1, 1), mode="replicate")
         target_pad = F.pad(target, (1, 1, 1, 1), mode="replicate")
@@ -67,51 +71,25 @@ class CompositeSpectrogramLoss(nn.Module):
 
         return loss_x + loss_y
 
-    def _spectral_convergence(
-        self, pred_log_spec: torch.Tensor, target_log_spec: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Calculates Spectral Convergence in the linear magnitude domain.
-        Converts log-spectrograms back to linear scale before computing the Frobenius norm.
-        """
-        # 1. Convert back to linear magnitude scale
-        pred_linear_mag = torch.expm1(pred_log_spec)
-        target_linear_mag = torch.expm1(target_log_spec)
-
-        # 2. Compute the Frobenius norm on the linear magnitudes
-        norm_diff = torch.norm(target_linear_mag - pred_linear_mag, p="fro")
-        norm_target = torch.norm(target_linear_mag, p="fro")
-
-        # 3. Add a small epsilon to prevent division by zero
-        return norm_diff / (norm_target + 1e-8)
-
     def forward(
         self, pred_log_spec: torch.Tensor, target_log_spec: torch.Tensor
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        # Ensure tensors have shape (Batch, Channels, Height, Width) for F.conv2d
+
         if pred_log_spec.dim() == 3:
             pred_log_spec = pred_log_spec.unsqueeze(1)
             target_log_spec = target_log_spec.unsqueeze(1)
 
-        # 1. Calculate raw losses
         l1_raw = self._asymmetric_l1(pred_log_spec, target_log_spec)
         sobel_raw = self._sobel_loss(pred_log_spec, target_log_spec)
-        sc_raw = self._spectral_convergence(pred_log_spec, target_log_spec)
 
-        # 2. Apply weights
         weighted_l1 = self.l1_weight * l1_raw
         weighted_sobel = self.sobel_weight * sobel_raw
-        weighted_sc = self.sc_weight * sc_raw
 
-        # 3. Compute total loss
-        total_loss = weighted_l1 + weighted_sobel + weighted_sc
+        total_loss = weighted_l1 + weighted_sobel
 
-        # 4. Create a dictionary of the weighted components for logging
-        # Using the "loss/" prefix helps group them nicely in W&B and TensorBoard
         loss_components = {
             "loss/l1_asymmetric": weighted_l1,
             "loss/sobel": weighted_sobel,
-            "loss/spectral_convergence": weighted_sc,
         }
 
         return total_loss, loss_components
