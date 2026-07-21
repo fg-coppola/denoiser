@@ -10,7 +10,7 @@ import torchaudio
 import torchaudio.functional as F_audio
 import torchaudio.transforms as T
 
-from models import ResidualMaskingDenoiser, RestorationModule, UNet
+from models import RatioMaskingDenoiser, RestorationModule, UNet
 
 
 class AudioRestorer:
@@ -34,9 +34,9 @@ class AudioRestorer:
             base_features=base_features,
             # kernel_size=(11, 5),
         )
-        residual_denoiser = ResidualMaskingDenoiser(base_model=unet)
+        ratio_denoiser = RatioMaskingDenoiser(base_model=unet)
         self.model = RestorationModule.load_from_checkpoint(
-            checkpoint_path, denoiser=residual_denoiser, strict=False
+            checkpoint_path, denoiser=ratio_denoiser, strict=False
         )
         self.model.eval()
         self.model.to(self.device)
