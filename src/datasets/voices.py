@@ -1,5 +1,6 @@
 import torch
 import torchaudio
+import torchaudio.functional as F
 from torch.utils.data import Dataset, Subset, random_split
 from torchvision import transforms
 
@@ -9,8 +10,12 @@ from .base import BaseDataModule
 
 
 class LogMagnitudeSpectrogram:
-    def __init__(self, sample_rate=16000, n_fft=1024, hop_length=256):
+    def __init__(
+        self, sample_rate=16000, n_fft=1024, hop_length=256, preemph_coeff=0.97
+    ):
         self.sample_rate = sample_rate
+        self.preemph_coeff = preemph_coeff
+
         self.spectrogram = torchaudio.transforms.Spectrogram(
             n_fft=n_fft,
             hop_length=hop_length,
@@ -24,6 +29,9 @@ class LogMagnitudeSpectrogram:
             raise ValueError(
                 f"Input waveform must have shape [T], got {tuple(waveform.shape)}"
             )
+
+        if self.preemph_coeff > 0.0:
+            waveform = F.preemphasis(waveform, coeff=self.preemph_coeff)
 
         spec = self.spectrogram(waveform)
         spec = torch.log1p(spec)

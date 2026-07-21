@@ -1,4 +1,5 @@
 import argparse
+import os
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -6,6 +7,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 import torchaudio
+import torchaudio.functional as F_audio
 import torchaudio.transforms as T
 
 from models import ResidualMaskingDenoiser, RestorationModule, UNet
@@ -14,7 +16,7 @@ from models import ResidualMaskingDenoiser, RestorationModule, UNet
 class AudioRestorer:
     """
     A class dedicated to restoring noisy audio using a trained U-Net model,
-    with built-in support for saving spectrogram comparison plots.
+    with built-in support for saving spectrogram comparison plots and running oracle A/B tests.
     """
 
     def __init__(
@@ -57,15 +59,23 @@ class AudioRestorer:
         return log_spec, pad_amount
 
     def _load_and_resample(self, file_path: str) -> torch.Tensor:
-        """Helper method to load an audio file and format it for STFT."""
+        """
+        Helper method to load an audio file, format it for STFT,
+        and apply the necessary pre-emphasis filter.
+        """
         waveform, sr = torchaudio.load(file_path)
 
+        # Convert to mono if stereo
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
 
+        # Resample if sample rates do not match
         if sr != self.sample_rate:
             resampler = T.Resample(orig_freq=sr, new_freq=self.sample_rate)
             waveform = resampler(waveform)
+
+        # Apply pre-emphasis to balance the spectrum before STFT
+        waveform = F_audio.preemphasis(waveform, coeff=0.97)
 
         return waveform.to(self.device)
 
@@ -110,117 +120,26 @@ class AudioRestorer:
         plt.close(fig)
         print(f"Spectrogram comparison saved to: {img_path.absolute()}")
 
-    def restore_audio(
-        self, input_path: str, output_path: str, reference_path: str = None
-    ):
-        print(f"\nProcessing file: {input_path}")
-
-        # 1. Load noisy waveform
-        waveform = self._load_and_resample(input_path)
-        original_length = waveform.shape[-1]
-
-        # 2. Extract Complex STFT
-        print("Extracting Phase and Magnitude...")
-        stft_complex = torch.stft(
-            waveform,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            window=self.window,
-            center=True,
-            return_complex=True,
-        )
-
-        magnitude = torch.abs(stft_complex)
-        noisy_phase = torch.angle(stft_complex)
-
-        # 3. Pre-process for the U-Net
-        noisy_log_spec = torch.log1p(magnitude)
-        padded_log_spec, pad_amount = self._pad_for_unet(noisy_log_spec)
-        input_tensor = padded_log_spec.unsqueeze(0)
-
-        # 4. Neural Network Inference
-        print("Enhancing Magnitude using U-Net...")
-        with torch.no_grad():
-            output_log_spec = self.model(input_tensor)
-
-        # 5. Post-process U-Net output
-        output_log_spec = output_log_spec.squeeze(0)
-
-        if pad_amount > 0:
-            output_log_spec = output_log_spec[..., :-pad_amount]
-
-        # 6. Generate Comparison Plot
-        # We process the reference file if provided to get its log spectrogram
-        ref_log_spec = None
-        if reference_path:
-            print(f"Loading reference clean audio: {reference_path}")
-            ref_waveform = self._load_and_resample(reference_path)
-
-            ref_stft = torch.stft(
-                ref_waveform,
-                n_fft=self.n_fft,
-                hop_length=self.hop_length,
-                win_length=self.win_length,
-                window=self.window,
-                center=True,
-                return_complex=True,
-            )
-            ref_log_spec = torch.log1p(torch.abs(ref_stft))
-
-        print("Generating spectrogram plot...")
-        self._save_spectrogram_plot(
-            noisy_spec=noisy_log_spec.squeeze(0),
-            restored_spec=output_log_spec.squeeze(0),
-            output_path=output_path,
-            reference_spec=ref_log_spec.squeeze(0)
-            if ref_log_spec is not None
-            else None,
-        )
-
-        # 7. Reconstruct the Audio
-        clean_magnitude = torch.expm1(output_log_spec)
-        print("Reconstructing waveform (Inverse STFT)...")
-        reconstructed_complex = torch.polar(clean_magnitude, noisy_phase)
-
-        reconstructed_waveform = torch.istft(
-            reconstructed_complex,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            window=self.window,
-            center=True,
-            length=original_length,
-        )
-
-        # 8. Save the final cleaned audio
-        reconstructed_waveform = reconstructed_waveform.cpu()
-
-        out_file = Path(output_path)
-        out_file.parent.mkdir(parents=True, exist_ok=True)
-
-        torchaudio.save(
-            str(out_file),
-            reconstructed_waveform,
-            sample_rate=self.sample_rate,
-        )
-        print(f"Success! Saved output audio to: {out_file.absolute()}\n")
-
-    def run_oracle_test(self, noisy_path: str, clean_path: str, output_dir: str):
+    def evaluate_and_restore(self, noisy_path: str, clean_path: str, output_dir: str):
         """
-        Runs oracle tests to isolate whether audio artifacts are caused
-        by the model's magnitude prediction or the noisy phase reconstruction.
+        Runs full evaluation by predicting the clean magnitude and producing
+        Test A, Test B, Test C reconstructions, alongside a comparison spectrogram plot.
+        All outputs are saved to the provided output directory.
         """
-        import os
+        print("\n--- Running Oracle Evaluation & Audio Restoration ---")
+        print(f"Noisy file: {noisy_path}")
+        print(f"Clean file: {clean_path}")
 
-        print("\n--- Running Oracle Tests ---")
+        # Ensure the target directory exists
+        os.makedirs(output_dir, exist_ok=True)
 
         # 1. Load both aligned waveforms
         noisy_waveform = self._load_and_resample(noisy_path)
         clean_waveform = self._load_and_resample(clean_path)
         original_length = noisy_waveform.shape[-1]
 
-        # 2. Extract STFT components for both
+        # 2. Extract Complex STFT for both
+        print("Extracting Phase and Magnitude components...")
         noisy_stft = torch.stft(
             noisy_waveform,
             n_fft=self.n_fft,
@@ -246,76 +165,91 @@ class AudioRestorer:
         clean_mag = torch.abs(clean_stft)
         clean_phase = torch.angle(clean_stft)
 
-        # 3. Get Model's Prediction
+        # 3. Pre-process for the U-Net (Log magnitudes)
         noisy_log_spec = torch.log1p(noisy_mag)
+        clean_log_spec = torch.log1p(clean_mag)
         padded_log_spec, pad_amount = self._pad_for_unet(noisy_log_spec)
 
+        # 4. Neural Network Inference
+        print("Enhancing Magnitude using U-Net...")
         with torch.no_grad():
             pred_log_spec = self.model(padded_log_spec.unsqueeze(0)).squeeze(0)
 
+        # Remove padding if it was added
         if pad_amount > 0:
             pred_log_spec = pred_log_spec[..., :-pad_amount]
 
         pred_mag = torch.expm1(pred_log_spec)
 
-        # 4. RECONSTRUCTION EXPERIMENTS
+        # 5. Generate and Save Comparison Plot
+        print("Generating spectrogram comparison plot...")
+        plot_path = os.path.join(output_dir, "spectrogram_comparison.png")
+        self._save_spectrogram_plot(
+            noisy_spec=noisy_log_spec.squeeze(0),
+            restored_spec=pred_log_spec.squeeze(0),
+            output_path=plot_path,
+            reference_spec=clean_log_spec.squeeze(0),
+        )
+
+        # 6. RECONSTRUCTION EXPERIMENTS
+        print("Reconstructing waveform variations (Inverse STFT)...")
+
+        # Helper function for generating audio from mag and phase
+        def reconstruct_audio(magnitude, phase):
+            complex_spec = torch.polar(magnitude, phase)
+            wav = torch.istft(
+                complex_spec,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+                window=self.window,
+                center=True,
+                length=original_length,
+            )
+            wav = F_audio.deemphasis(wav, coeff=0.97)
+
+            # 2. DC Blocker: High-pass filter at 40 Hz to kill the integrator drift.
+            # This removes the extreme low-frequency rumble/boost without affecting human speech.
+            wav = F_audio.highpass_biquad(
+                wav, sample_rate=self.sample_rate, cutoff_freq=40.0
+            )
+
+            # The deemphasis acts as a leaky integrator and can boost peaks above 1.0
+            max_val = torch.max(torch.abs(wav))
+            if max_val > 1.0:
+                # Scale down to 0.99 to ensure no hard clipping on playback
+                wav = (wav / max_val) * 0.99
+            return wav.cpu()
 
         # Test A: The Phase Bottleneck (Clean Mag + Noisy Phase)
-        complex_a = torch.polar(clean_mag, noisy_phase)
-        audio_a = torch.istft(
-            complex_a,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            window=self.window,
-            center=True,
-            length=original_length,
-        )
+        audio_a = reconstruct_audio(clean_mag, noisy_phase)
 
         # Test B: The Model's True Quality (Predicted Mag + Clean Phase)
-        complex_b = torch.polar(pred_mag, clean_phase)
-        audio_b = torch.istft(
-            complex_b,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            window=self.window,
-            center=True,
-            length=original_length,
-        )
+        audio_b = reconstruct_audio(pred_mag, clean_phase)
 
         # Test C: Current Reality (Predicted Mag + Noisy Phase)
-        complex_c = torch.polar(pred_mag, noisy_phase)
-        audio_c = torch.istft(
-            complex_c,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            window=self.window,
-            center=True,
-            length=original_length,
-        )
+        audio_c = reconstruct_audio(pred_mag, noisy_phase)
 
-        # 5. Save all variations for A/B testing
-        os.makedirs(output_dir, exist_ok=True)
-
+        # 7. Save all variations in the output directory
         torchaudio.save(
             os.path.join(output_dir, "test_A_cleanMag_noisyPhase.wav"),
-            audio_a.cpu(),
+            audio_a,
             self.sample_rate,
         )
         torchaudio.save(
             os.path.join(output_dir, "test_B_predMag_cleanPhase.wav"),
-            audio_b.cpu(),
+            audio_b,
             self.sample_rate,
         )
         torchaudio.save(
             os.path.join(output_dir, "test_C_predMag_noisyPhase.wav"),
-            audio_c.cpu(),
+            audio_c,
             self.sample_rate,
         )
 
-        print(f"Oracle test files saved in: {output_dir}")
+        print(
+            f"Success! All audio tests and spectrograms saved in: {os.path.abspath(output_dir)}\n"
+        )
 
 
 if __name__ == "__main__":
@@ -332,8 +266,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output",
         type=str,
-        default="cleaned_output.wav",
-        help="Path where the cleaned audio will be saved",
+        default="output",
+        help="Path of the folder where the cleaned audio will be saved",
     )
     parser.add_argument(
         "--reference",
@@ -353,11 +287,8 @@ if __name__ == "__main__":
     restorer = AudioRestorer(
         checkpoint_path=args.ckpt, base_features=args.base_features
     )
-    restorer.restore_audio(
-        input_path=args.input, output_path=args.output, reference_path=args.reference
-    )
-    restorer.run_oracle_test(
+    restorer.evaluate_and_restore(
         noisy_path=args.input,
         clean_path=args.reference if args.reference else args.input,
-        output_dir=Path(args.output).parent / "oracle_tests",
+        output_dir=args.output,
     )
