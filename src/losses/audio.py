@@ -93,3 +93,37 @@ class CompositeSpectrogramLoss(nn.Module):
         }
 
         return total_loss, loss_components
+
+
+class WeightedDualDomainLoss(nn.Module):
+    """
+    Computes the L1 loss in both linear and logarithmic magnitude domains,
+    applying specific weights to balance the gradient magnitudes.
+    """
+
+    def __init__(self, linear_weight: float = 1.0, log_weight: float = 1.0):
+        super().__init__()
+        self.linear_weight = linear_weight
+        self.log_weight = log_weight
+
+    def forward(
+        self, pred_log_spec: torch.Tensor, target_log_spec: torch.Tensor
+    ) -> torch.Tensor:
+
+        # 1. Calculate Linear Loss (Focuses on volume and formants)
+        pred_mag = torch.expm1(pred_log_spec)
+        target_mag = torch.expm1(target_log_spec)
+        linear_loss = F.l1_loss(pred_mag, target_mag)
+
+        # 2. Calculate Log Loss (Focuses on high frequencies and details)
+        log_loss = F.l1_loss(pred_log_spec, target_log_spec)
+
+        # 3. Combine with weights
+        total_loss = (self.linear_weight * linear_loss) + (self.log_weight * log_loss)
+
+        loss_components = {
+            "loss/l1_log": log_loss,
+            "loss/l1_linear": linear_loss,
+        }
+
+        return total_loss, loss_components
