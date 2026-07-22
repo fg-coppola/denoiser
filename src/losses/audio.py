@@ -3,127 +3,76 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class CompositeSpectrogramLoss(nn.Module):
-    """
-    Composite loss function tailored for log-spectrogram prediction.
-    Uses Asymmetric L1 for magnitude alignment and Sobel for edge/formant preservation.
-    """
-
+class DereverberationLoss(nn.Module):
     def __init__(
         self,
-        l1_weight: float = 1.0,
-        sobel_weight: float = 0.5,
-        asymmetry_penalty: float = 2.5,
+        gamma_over=2.0,
+        gamma_under=0.5,
+        lambda_sa=1.0,
+        lambda_asym=0.5,
+        lambda_delta=0.2,
     ):
-        super().__init__()
-        self.l1_weight = l1_weight
-        self.sobel_weight = sobel_weight
-        self.asymmetry_penalty = asymmetry_penalty
+        """
+        Initializes the multi-objective loss for dereverberation.
+        Assumes inputs are already power-law compressed (e.g., c=0.3 in the dataloader)
+        and the predicted spectrogram is already masked by the network.
 
-        # Define Sobel kernels for edge detection (X and Y directions)
-        sobel_x = torch.tensor(
-            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32
+        Args:
+            gamma_over (float): Penalty weight for over-suppression (speech degradation).
+            gamma_under (float): Penalty weight for under-suppression (residual reverberation).
+            lambda_sa (float): Weight for the Signal Approximation (L1) Loss.
+            lambda_asym (float): Weight for the Asymmetric Loss.
+            lambda_delta (float): Weight for the Temporal Delta Loss.
+        """
+        super(DereverberationLoss, self).__init__()
+        self.gamma_over = gamma_over
+        self.gamma_under = gamma_under
+        self.lambda_sa = lambda_sa
+        self.lambda_asym = lambda_asym
+        self.lambda_delta = lambda_delta
+
+    def forward(self, pred_comp, target_comp):
+        """
+        Computes the global loss.
+        Expected tensor shape: [Batch, Channels, Frequency, Time].
+
+        Args:
+            pred_comp: Predicted power-law compressed magnitude spectrogram
+                       (already masked by the model: mask * input_compressed).
+            target_comp: Target (clean) power-law compressed magnitude spectrogram.
+        """
+        # 1. Signal Approximation Loss (L1)
+        # Measures the absolute error between the predicted and target spectrograms
+        loss_sa = F.l1_loss(pred_comp, target_comp)
+
+        # 2. Asymmetric Over-Suppression Penalty Loss
+        # Calculate the directional error
+        error = pred_comp - target_comp
+
+        # error < 0: network predicted less energy than target (speech over-suppression)
+        # error >= 0: network predicted more energy than target (residual reverberation)
+        asym_penalty = torch.where(
+            error < 0,
+            self.gamma_over * torch.abs(error),
+            self.gamma_under * torch.abs(error),
         )
-        sobel_y = torch.tensor(
-            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32
+
+        loss_asym = torch.mean(asym_penalty)
+
+        # 3. Delta Spectrum Temporal Continuity Loss
+        # Calculate first-order differences along the time axis (last dimension)
+        # This forces the predicted envelope to decay smoothly like natural acoustics,
+        # avoiding abrupt cuts that cause musical noise.
+        diff_pred = pred_comp[..., 1:] - pred_comp[..., :-1]
+        diff_target = target_comp[..., 1:] - target_comp[..., :-1]
+
+        loss_delta = F.l1_loss(diff_pred, diff_target)
+
+        # Compute the total weighted loss
+        total_loss = (
+            (self.lambda_sa * loss_sa)
+            + (self.lambda_asym * loss_asym)
+            + (self.lambda_delta * loss_delta)
         )
 
-        # Reshape for F.conv2d (out_channels, in_channels, kernel_height, kernel_width)
-        self.register_buffer("sobel_x", sobel_x.view(1, 1, 3, 3))
-        self.register_buffer("sobel_y", sobel_y.view(1, 1, 3, 3))
-
-    def _asymmetric_l1(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Calculates Log STFT Magnitude Loss with asymmetric penalization.
-        Operates securely in the log domain.
-        """
-        diff = pred - target
-        abs_diff = torch.abs(diff)
-
-        # Create a mask where prediction is lower than target
-        under_estimation = (diff < 0).float()
-
-        # Apply the penalty weight to the under-estimated pixels
-        weighted_diff = abs_diff * (
-            1.0 + (self.asymmetry_penalty - 1.0) * under_estimation
-        )
-        return weighted_diff.mean()
-
-    def _sobel_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Computes L1 loss on the spatial gradients (edges) of the log-spectrograms.
-        Crucial for preserving harmonic lines and high-frequency transients.
-        """
-        # Pad inputs to keep spatial dimensions same after convolution
-        pred_pad = F.pad(pred, (1, 1, 1, 1), mode="replicate")
-        target_pad = F.pad(target, (1, 1, 1, 1), mode="replicate")
-
-        # Apply Sobel filters
-        pred_grad_x = F.conv2d(pred_pad, self.sobel_x)
-        pred_grad_y = F.conv2d(pred_pad, self.sobel_y)
-
-        target_grad_x = F.conv2d(target_pad, self.sobel_x)
-        target_grad_y = F.conv2d(target_pad, self.sobel_y)
-
-        # Calculate L1 loss on the gradients
-        loss_x = F.l1_loss(pred_grad_x, target_grad_x)
-        loss_y = F.l1_loss(pred_grad_y, target_grad_y)
-
-        return loss_x + loss_y
-
-    def forward(
-        self, pred_log_spec: torch.Tensor, target_log_spec: torch.Tensor
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-
-        if pred_log_spec.dim() == 3:
-            pred_log_spec = pred_log_spec.unsqueeze(1)
-            target_log_spec = target_log_spec.unsqueeze(1)
-
-        l1_raw = self._asymmetric_l1(pred_log_spec, target_log_spec)
-        sobel_raw = self._sobel_loss(pred_log_spec, target_log_spec)
-
-        weighted_l1 = self.l1_weight * l1_raw
-        weighted_sobel = self.sobel_weight * sobel_raw
-
-        total_loss = weighted_l1 + weighted_sobel
-
-        loss_components = {
-            "loss/l1_asymmetric": weighted_l1,
-            "loss/sobel": weighted_sobel,
-        }
-
-        return total_loss, loss_components
-
-
-class WeightedDualDomainLoss(nn.Module):
-    """
-    Computes the L1 loss in both linear and logarithmic magnitude domains,
-    applying specific weights to balance the gradient magnitudes.
-    """
-
-    def __init__(self, linear_weight: float = 1.0, log_weight: float = 1.0):
-        super().__init__()
-        self.linear_weight = linear_weight
-        self.log_weight = log_weight
-
-    def forward(
-        self, pred_log_spec: torch.Tensor, target_log_spec: torch.Tensor
-    ) -> torch.Tensor:
-
-        # 1. Calculate Linear Loss (Focuses on volume and formants)
-        pred_mag = torch.expm1(pred_log_spec)
-        target_mag = torch.expm1(target_log_spec)
-        linear_loss = F.l1_loss(pred_mag, target_mag)
-
-        # 2. Calculate Log Loss (Focuses on high frequencies and details)
-        log_loss = F.l1_loss(pred_log_spec, target_log_spec)
-
-        # 3. Combine with weights
-        total_loss = (self.linear_weight * linear_loss) + (self.log_weight * log_loss)
-
-        loss_components = {
-            "loss/l1_log": log_loss,
-            "loss/l1_linear": linear_loss,
-        }
-
-        return total_loss, loss_components
+        return total_loss

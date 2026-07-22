@@ -8,7 +8,7 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from datasets.voices import RIRDataModule
-from losses.audio import WeightedDualDomainLoss
+from losses.audio import DereverberationLoss
 from models import RatioMaskingDenoiser, RestorationModule, UNet
 
 
@@ -33,16 +33,18 @@ def main(
 
     logger = TensorBoardLogger(save_dir=logs_dir, name=experiment_name)
 
-    # criterion = CompositeSpectrogramLoss(
-    #     l1_weight=1.0, sobel_weight=1.0, asymmetry_penalty=3.0
-    # )
-    criterion = WeightedDualDomainLoss(linear_weight=1.0, log_weight=1.0)
+    criterion = DereverberationLoss(
+        gamma_over=2.0,
+        gamma_under=0.5,
+        lambda_sa=1.0,
+        lambda_asym=0.5,
+        lambda_delta=0.2,
+    )
 
     unet = UNet(
         in_channels=1,
         out_channels=1,
         base_features=base_features,
-        # kernel_size=(11, 5),  # Asymmetric kernel for audio spectrograms
     )
     ratio_denoiser = RatioMaskingDenoiser(base_model=unet)
     rir_model = RestorationModule(
