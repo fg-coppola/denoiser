@@ -1,6 +1,5 @@
 import torch
 import torchaudio
-import torchaudio.functional as F
 from torch.utils.data import Dataset, Subset, random_split
 from torchvision import transforms
 
@@ -9,12 +8,9 @@ from transforms.rir import ApplyRIR
 from .base import BaseDataModule
 
 
-class LogMagnitudeSpectrogram:
-    def __init__(
-        self, sample_rate=16000, n_fft=1024, hop_length=256, preemph_coeff=0.97
-    ):
+class MagnitudeSpectrogram:
+    def __init__(self, sample_rate=16000, n_fft=1024, hop_length=256):
         self.sample_rate = sample_rate
-        self.preemph_coeff = preemph_coeff
 
         self.spectrogram = torchaudio.transforms.Spectrogram(
             n_fft=n_fft,
@@ -30,12 +26,20 @@ class LogMagnitudeSpectrogram:
                 f"Input waveform must have shape [T], got {tuple(waveform.shape)}"
             )
 
-        if self.preemph_coeff > 0.0:
-            waveform = F.preemphasis(waveform, coeff=self.preemph_coeff)
-
+        # Computes only the linear magnitude spectrogram
         spec = self.spectrogram(waveform)
-        spec = torch.log1p(spec)
         return spec.unsqueeze(0)
+
+
+class PowerLawCompression:
+    def __init__(self, compression_factor=0.3):
+        self.compression_factor = compression_factor
+
+    def __call__(self, spec):
+        # Applies Power-Law Compression to the magnitude spectrogram
+        # Added clamp to prevent NaN values when calculating the power of exact zeros
+        spec = torch.clamp(spec, min=1e-8) ** self.compression_factor
+        return spec
 
 
 class UnlabeledVoiceDataset(Dataset):
@@ -101,13 +105,15 @@ class RIRDataModule(BaseDataModule):
 
         self.clean_transform = transforms.Compose(
             [
-                LogMagnitudeSpectrogram(),
+                MagnitudeSpectrogram(),
+                PowerLawCompression(),
             ]
         )
         self.noisy_transform = transforms.Compose(
             [
                 ApplyRIR(rir_maps),
-                LogMagnitudeSpectrogram(),
+                MagnitudeSpectrogram(),
+                PowerLawCompression(),
             ]
         )
 

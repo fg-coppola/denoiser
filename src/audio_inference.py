@@ -47,21 +47,22 @@ class AudioRestorer:
         self.win_length = 1024
         self.sample_rate = 16000
 
+        self.compression_factor = 0.3
+
         self.window = torch.hann_window(self.win_length).to(self.device)
 
-    def _pad_for_unet(self, log_spec: torch.Tensor) -> Tuple[torch.Tensor, int]:
-        time_frames = log_spec.shape[-1]
+    def _pad_for_unet(self, spec: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        time_frames = spec.shape[-1]
         pad_amount = (16 - (time_frames % 16)) % 16
 
         if pad_amount > 0:
-            log_spec = F.pad(log_spec, (0, pad_amount))
+            spec = F.pad(spec, (0, pad_amount))
 
-        return log_spec, pad_amount
+        return spec, pad_amount
 
     def _load_and_resample(self, file_path: str) -> torch.Tensor:
         """
-        Helper method to load an audio file, format it for STFT,
-        and apply the necessary pre-emphasis filter.
+        Helper method to load an audio file and format it for STFT.
         """
         waveform, sr = torchaudio.load(file_path)
 
@@ -74,9 +75,6 @@ class AudioRestorer:
             resampler = T.Resample(orig_freq=sr, new_freq=self.sample_rate)
             waveform = resampler(waveform)
 
-        # Apply pre-emphasis to balance the spectrum before STFT
-        waveform = F_audio.preemphasis(waveform, coeff=0.97)
-
         return waveform.to(self.device)
 
     def _save_spectrogram_plot(
@@ -86,7 +84,7 @@ class AudioRestorer:
         output_path: str,
         reference_spec: Optional[torch.Tensor] = None,
     ):
-        """Generates and saves a side-by-side comparison image of the log spectrograms."""
+        """Generates and saves a side-by-side comparison image of the spectrograms."""
         num_plots = 3 if reference_spec is not None else 2
         fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 5))
 
@@ -165,30 +163,32 @@ class AudioRestorer:
         clean_mag = torch.abs(clean_stft)
         clean_phase = torch.angle(clean_stft)
 
-        # 3. Pre-process for the U-Net (Log magnitudes)
-        noisy_log_spec = torch.log1p(noisy_mag)
-        clean_log_spec = torch.log1p(clean_mag)
-        padded_log_spec, pad_amount = self._pad_for_unet(noisy_log_spec)
+        # 3. Pre-process for the U-Net (Power-Law Compression)
+        noisy_comp_spec = torch.clamp(noisy_mag, min=1e-8) ** self.compression_factor
+        clean_comp_spec = torch.clamp(clean_mag, min=1e-8) ** self.compression_factor
+
+        padded_comp_spec, pad_amount = self._pad_for_unet(noisy_comp_spec)
 
         # 4. Neural Network Inference
         print("Enhancing Magnitude using U-Net...")
         with torch.no_grad():
-            pred_log_spec = self.model(padded_log_spec.unsqueeze(0)).squeeze(0)
+            pred_comp_spec = self.model(padded_comp_spec.unsqueeze(0)).squeeze(0)
 
         # Remove padding if it was added
         if pad_amount > 0:
-            pred_log_spec = pred_log_spec[..., :-pad_amount]
+            pred_comp_spec = pred_comp_spec[..., :-pad_amount]
 
-        pred_mag = torch.expm1(pred_log_spec)
+        # Invert the Power-Law Compression to get the linear magnitude for iSTFT
+        pred_mag = pred_comp_spec ** (1.0 / self.compression_factor)
 
         # 5. Generate and Save Comparison Plot
         print("Generating spectrogram comparison plot...")
         plot_path = os.path.join(output_dir, "spectrogram_comparison.png")
         self._save_spectrogram_plot(
-            noisy_spec=noisy_log_spec.squeeze(0),
-            restored_spec=pred_log_spec.squeeze(0),
+            noisy_spec=noisy_comp_spec.squeeze(0),
+            restored_spec=pred_comp_spec.squeeze(0),
             output_path=plot_path,
-            reference_spec=clean_log_spec.squeeze(0),
+            reference_spec=clean_comp_spec.squeeze(0),
         )
 
         # 6. RECONSTRUCTION EXPERIMENTS
@@ -206,15 +206,13 @@ class AudioRestorer:
                 center=True,
                 length=original_length,
             )
-            wav = F_audio.deemphasis(wav, coeff=0.97)
 
-            # 2. DC Blocker: High-pass filter at 40 Hz to kill the integrator drift.
-            # This removes the extreme low-frequency rumble/boost without affecting human speech.
+            # DC Blocker: High-pass filter at 40 Hz.
+            # Still useful to remove extreme low-frequency rumble without affecting human speech.
             wav = F_audio.highpass_biquad(
                 wav, sample_rate=self.sample_rate, cutoff_freq=40.0
             )
 
-            # The deemphasis acts as a leaky integrator and can boost peaks above 1.0
             max_val = torch.max(torch.abs(wav))
             if max_val > 1.0:
                 # Scale down to 0.99 to ensure no hard clipping on playback
