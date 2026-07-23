@@ -8,7 +8,9 @@ from transforms.rir import ApplyRIR
 from .base import BaseDataModule
 
 
-class MagnitudeSpectrogram:
+class STFTFeatureExtractor:
+    """Extracts both Magnitude and Phase from the waveform."""
+
     def __init__(self, sample_rate=16000, n_fft=1024, hop_length=256):
         self.sample_rate = sample_rate
 
@@ -16,7 +18,7 @@ class MagnitudeSpectrogram:
             n_fft=n_fft,
             hop_length=hop_length,
             win_length=n_fft,
-            power=1.0,
+            power=None,  # Setting power to None returns the Complex STFT
             normalized=False,
         )
 
@@ -26,20 +28,36 @@ class MagnitudeSpectrogram:
                 f"Input waveform must have shape [T], got {tuple(waveform.shape)}"
             )
 
-        # Computes only the linear magnitude spectrogram
-        spec = self.spectrogram(waveform)
-        return spec.unsqueeze(0)
+        complex_spec = self.spectrogram(waveform)
+
+        # Extract magnitude and phase
+        mag = torch.abs(complex_spec)
+        phase = torch.angle(complex_spec)
+
+        return mag.unsqueeze(0), phase.unsqueeze(0)
 
 
 class PowerLawCompression:
+    """Applies compression only to the magnitude, passing the phase untouched."""
+
     def __init__(self, compression_factor=0.3):
         self.compression_factor = compression_factor
 
-    def __call__(self, spec):
-        # Applies Power-Law Compression to the magnitude spectrogram
-        # Added clamp to prevent NaN values when calculating the power of exact zeros
-        spec = torch.clamp(spec, min=1e-8) ** self.compression_factor
-        return spec
+    def __call__(self, features):
+        mag, phase = features
+
+        # Compress magnitude
+        comp_mag = torch.clamp(mag, min=1e-8) ** self.compression_factor
+
+        return comp_mag, phase
+
+
+class IdentityWaveform:
+    """Passes the raw waveform untouched (used for the clean target in MR-STFT)."""
+
+    def __call__(self, waveform):
+        # Add channel dimension to match expected PyTorch conventions [1, T]
+        return waveform.unsqueeze(0)
 
 
 class UnlabeledVoiceDataset(Dataset):
@@ -81,9 +99,13 @@ class UnlabeledVoiceDataset(Dataset):
                 (0, self.target_num_samples - current_num_samples),
             )
 
-        clean_spectrogram = self.clean_transform(waveform)
-        noisy_spectrogram = self.noisy_transform(waveform)
-        return noisy_spectrogram, clean_spectrogram
+        # clean_target is now just the padded waveform [1, T]
+        clean_target = self.clean_transform(waveform)
+
+        # noisy_inputs is now a tuple: (noisy_comp_mag, noisy_phase)
+        noisy_inputs = self.noisy_transform(waveform)
+
+        return noisy_inputs, clean_target
 
 
 class RIRDataModule(BaseDataModule):
@@ -105,14 +127,13 @@ class RIRDataModule(BaseDataModule):
 
         self.clean_transform = transforms.Compose(
             [
-                MagnitudeSpectrogram(),
-                PowerLawCompression(),
+                IdentityWaveform(),
             ]
         )
         self.noisy_transform = transforms.Compose(
             [
                 ApplyRIR(rir_maps),
-                MagnitudeSpectrogram(),
+                STFTFeatureExtractor(),
                 PowerLawCompression(),
             ]
         )

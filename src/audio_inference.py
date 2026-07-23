@@ -10,12 +10,13 @@ import torchaudio
 import torchaudio.functional as F_audio
 import torchaudio.transforms as T
 
-from models import RatioMaskingDenoiser, RestorationModule, UNet
+from models import ComplexRatioMaskingDenoiser, RestorationModule, UNet
 
 
 class AudioRestorer:
     """
-    A class dedicated to restoring noisy audio using a trained U-Net model,
+    A class dedicated to restoring noisy audio using a trained U-Net model.
+    Now upgraded to handle Complex Spectrogram predictions (Magnitude + Phase),
     with built-in support for saving spectrogram comparison plots and running oracle A/B tests.
     """
 
@@ -28,15 +29,16 @@ class AudioRestorer:
         print(f"Loading model onto {self.device} from: {checkpoint_path}")
 
         # Initialize the model architecture
+        # in_channels and out_channels are 2 to handle Real and Imaginary parts
         unet = UNet(
-            in_channels=1,
-            out_channels=1,
+            in_channels=2,
+            out_channels=2,
             base_features=base_features,
             # kernel_size=(11, 5),
         )
-        ratio_denoiser = RatioMaskingDenoiser(base_model=unet)
+        complex_denoiser = ComplexRatioMaskingDenoiser(base_model=unet)
         self.model = RestorationModule.load_from_checkpoint(
-            checkpoint_path, denoiser=ratio_denoiser, strict=False
+            checkpoint_path, model=complex_denoiser, strict=False
         )
         self.model.eval()
         self.model.to(self.device)
@@ -120,8 +122,8 @@ class AudioRestorer:
 
     def evaluate_and_restore(self, noisy_path: str, clean_path: str, output_dir: str):
         """
-        Runs full evaluation by predicting the clean magnitude and producing
-        Test A, Test B, Test C reconstructions, alongside a comparison spectrogram plot.
+        Runs full evaluation by predicting both real and imaginary components,
+        and producing Test A, B, C, D reconstructions alongside a comparison plot.
         All outputs are saved to the provided output directory.
         """
         print("\n--- Running Oracle Evaluation & Audio Restoration ---")
@@ -168,25 +170,37 @@ class AudioRestorer:
         clean_comp_spec = torch.clamp(clean_mag, min=1e-8) ** self.compression_factor
 
         padded_comp_spec, pad_amount = self._pad_for_unet(noisy_comp_spec)
+        padded_noisy_phase, _ = self._pad_for_unet(noisy_phase)
 
-        # 4. Neural Network Inference
-        print("Enhancing Magnitude using U-Net...")
+        # 4. Neural Network Inference (Complex Domain)
+        print("Enhancing Spectrogram using Complex U-Net...")
         with torch.no_grad():
-            pred_comp_spec = self.model(padded_comp_spec.unsqueeze(0)).squeeze(0)
+            # Model now returns predicted Real and Imaginary components
+            pred_real, pred_imag = self.model(
+                padded_comp_spec.unsqueeze(0), padded_noisy_phase.unsqueeze(0)
+            )
+            pred_real = pred_real.squeeze(0)
+            pred_imag = pred_imag.squeeze(0)
 
         # Remove padding if it was added
         if pad_amount > 0:
-            pred_comp_spec = pred_comp_spec[..., :-pad_amount]
+            pred_real = pred_real[..., :-pad_amount]
+            pred_imag = pred_imag[..., :-pad_amount]
+
+        # Convert Cartesian (Real/Imag) back to Polar (Mag/Phase)
+        pred_complex = torch.complex(pred_real, pred_imag)
+        pred_comp_mag = torch.abs(pred_complex)
+        pred_phase = torch.angle(pred_complex)
 
         # Invert the Power-Law Compression to get the linear magnitude for iSTFT
-        pred_mag = pred_comp_spec ** (1.0 / self.compression_factor)
+        pred_mag = pred_comp_mag ** (1.0 / self.compression_factor)
 
         # 5. Generate and Save Comparison Plot
         print("Generating spectrogram comparison plot...")
         plot_path = os.path.join(output_dir, "spectrogram_comparison.png")
         self._save_spectrogram_plot(
             noisy_spec=noisy_comp_spec.squeeze(0),
-            restored_spec=pred_comp_spec.squeeze(0),
+            restored_spec=pred_comp_mag.squeeze(0),
             output_path=plot_path,
             reference_spec=clean_comp_spec.squeeze(0),
         )
@@ -208,7 +222,6 @@ class AudioRestorer:
             )
 
             # DC Blocker: High-pass filter at 40 Hz.
-            # Still useful to remove extreme low-frequency rumble without affecting human speech.
             wav = F_audio.highpass_biquad(
                 wav, sample_rate=self.sample_rate, cutoff_freq=40.0
             )
@@ -222,11 +235,14 @@ class AudioRestorer:
         # Test A: The Phase Bottleneck (Clean Mag + Noisy Phase)
         audio_a = reconstruct_audio(clean_mag, noisy_phase)
 
-        # Test B: The Model's True Quality (Predicted Mag + Clean Phase)
+        # Test B: Oracle Target (Pred Mag + Clean Phase)
         audio_b = reconstruct_audio(pred_mag, clean_phase)
 
-        # Test C: Current Reality (Predicted Mag + Noisy Phase)
-        audio_c = reconstruct_audio(pred_mag, noisy_phase)
+        # Test C: THE ACTUAL SYSTEM OUTPUT (Pred Mag + PRED Phase)
+        audio_c = reconstruct_audio(pred_mag, pred_phase)
+
+        # Test D: The Old Reality (Pred Mag + Noisy Phase - for comparison)
+        audio_d = reconstruct_audio(pred_mag, noisy_phase)
 
         # 7. Save all variations in the output directory
         torchaudio.save(
@@ -240,8 +256,13 @@ class AudioRestorer:
             self.sample_rate,
         )
         torchaudio.save(
-            os.path.join(output_dir, "test_C_predMag_noisyPhase.wav"),
+            os.path.join(output_dir, "test_C_predMag_PREDPhase.wav"),
             audio_c,
+            self.sample_rate,
+        )
+        torchaudio.save(
+            os.path.join(output_dir, "test_D_predMag_noisyPhase.wav"),
+            audio_d,
             self.sample_rate,
         )
 
@@ -251,7 +272,7 @@ class AudioRestorer:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="U-Net Audio Inference (Noisy Phase)")
+    parser = argparse.ArgumentParser(description="Complex U-Net Audio Inference")
     parser.add_argument(
         "--input", type=str, required=True, help="Path to the noisy input .wav file"
     )

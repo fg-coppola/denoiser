@@ -8,8 +8,8 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from datasets.voices import RIRDataModule
-from losses.audio import DereverberationLoss
-from models import RatioMaskingDenoiser, RestorationModule, UNet
+from losses.audio import ComplexDereverberationLoss
+from models import ComplexRatioMaskingDenoiser, RestorationModule, UNet
 
 
 def main(
@@ -33,22 +33,24 @@ def main(
 
     logger = TensorBoardLogger(save_dir=logs_dir, name=experiment_name)
 
-    criterion = DereverberationLoss(
-        gamma_over=2.0,
-        gamma_under=0.5,
-        lambda_sa=1.0,
-        lambda_asym=0.5,
-        lambda_delta=0.2,
+    # STFT parameters must match exactly those used in the data loader's STFTFeatureExtractor
+    criterion = ComplexDereverberationLoss(
+        original_n_fft=1024,
+        original_hop=256,
+        original_win=1024,
+        compression_factor=0.3,
+        lambda_time=1.0,
+        lambda_mr_stft=1.0,
     )
 
     unet = UNet(
-        in_channels=1,
-        out_channels=1,
+        in_channels=2,
+        out_channels=2,
         base_features=base_features,
     )
-    ratio_denoiser = RatioMaskingDenoiser(base_model=unet)
+    ratio_denoiser = ComplexRatioMaskingDenoiser(base_model=unet)
     rir_model = RestorationModule(
-        denoiser=ratio_denoiser,
+        model=ratio_denoiser,
         loss_fn=criterion,
         lr=1e-4,
     )

@@ -1,4 +1,4 @@
-from typing import Tuple, Union
+from typing import Any, Tuple, Union
 
 import pytorch_lightning as L
 import torch
@@ -181,103 +181,117 @@ class UNet(nn.Module):
         return logits
 
 
-class RatioMaskingDenoiser(nn.Module):
+class ComplexRatioMaskingDenoiser(nn.Module):
     """
-    A denoiser that uses a base model to predict a speech ratio mask,
-    which is then directly multiplied by the noisy input to recover the clean signal.
+    A denoiser that uses a base model to predict a Complex Ideal Ratio Mask (cIRM).
+    It converts magnitude and phase into real and imaginary components,
+    applies the complex mask, and returns the predicted real and imaginary parts.
     """
 
     def __init__(self, base_model: nn.Module):
         super().__init__()
         self.base_model = base_model
 
-    def forward(self, noisy_log_spec: torch.Tensor) -> torch.Tensor:
-        # 1. Base model predicts the logits for the SPEECH MASK
-        raw_mask_logits = self.base_model(noisy_log_spec)
-        speech_mask = torch.sigmoid(raw_mask_logits)
+    def forward(
+        self, noisy_comp_mag: torch.Tensor, noisy_phase: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 1. Convert polar coordinates (magnitude, phase) to Cartesian (real, imaginary)
+        # We do this directly in the compressed domain for numerical stability
+        noisy_real = noisy_comp_mag * torch.cos(noisy_phase)
+        noisy_imag = noisy_comp_mag * torch.sin(noisy_phase)
 
-        # 2. Transform the noisy input from log scale to linear magnitude scale
-        noisy_mag = torch.expm1(noisy_log_spec)
+        # 2. Stack to form a 2-channel input for the U-Net
+        # Shape becomes: [Batch, 2, Freq, Time]
+        unet_input = torch.cat([noisy_real, noisy_imag], dim=1)
 
-        # 3. Multiply directly to keep only the speech energy.
-        # This acts as a soft filter, completely avoiding negative values
-        # and eliminating the need for harsh ReLU clipping.
-        clean_mag = noisy_mag * speech_mask
+        # 3. Base model predicts the Complex Mask (2 channels: Real and Imaginary)
+        # No sigmoid activation is applied by the UNet, allowing negative mask values
+        cirm = self.base_model(unet_input)
+        mask_real = cirm[:, 0:1, :, :]
+        mask_imag = cirm[:, 1:2, :, :]
 
-        # 4. Return the clean signal back to log scale
-        clean_log_spec = torch.log1p(clean_mag)
+        # 4. Apply the Complex Ratio Mask via complex multiplication rules
+        pred_real = (noisy_real * mask_real) - (noisy_imag * mask_imag)
+        pred_imag = (noisy_real * mask_imag) + (noisy_imag * mask_real)
 
-        return clean_log_spec
+        # 5. Return the complex components to be handled by the loss function
+        return pred_real, pred_imag
 
 
 class RestorationModule(L.LightningModule):
     """
-    LightningModule wrapper for training the U-Net on signal restoration tasks.
-    Supports dynamic channel initialization and various loss functions.
+    Generic LightningModule wrapper for signal/image restoration tasks.
+    Agnostic to specific input formats, allowing reuse across different models.
     """
 
     def __init__(
         self,
-        denoiser: nn.Module,
-        loss_fn=nn.L1Loss(),
+        model: nn.Module,
+        loss_fn: nn.Module = nn.L1Loss(),
         lr: float = 1e-4,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["loss_fn", "denoiser"])
+        # Ignore complex objects to prevent PyTorch Lightning serialization issues
+        self.save_hyperparameters(ignore=["loss_fn", "model"])
 
-        self.model = denoiser
-        self.model = self.model.to(memory_format=torch.channels_last)
-
-        # Use the provided loss function for training; default is L1 Loss
+        self.model = model
         self.criterion = loss_fn
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.to(memory_format=torch.channels_last)
-        return self.model(x)
+        # Convert 4D weights to channels_last for performance
+        self._convert_model_memory_format()
 
-    def training_step(self, batch, batch_idx):
-        # batch yields: (noisy_input, clean_target)
-        noisy, clean = batch
-        reconstructed = self(noisy)
+    def _convert_model_memory_format(self):
+        """Safely applies channels_last memory format to applicable 4D layers."""
+        for param in self.model.parameters():
+            if param.dim() == 4:
+                param.data = param.data.to(memory_format=torch.channels_last)
 
-        # Handle both standard losses (single tensor) and composite losses (tuple of tensor and dict)
-        criterion_output = self.criterion(reconstructed, clean)
+    def _apply_memory_format(self, x: Any) -> Any:
+        """Recursively applies channels_last to 4D tensors in inputs."""
+        if isinstance(x, torch.Tensor):
+            return x.to(memory_format=torch.channels_last) if x.dim() == 4 else x
+        if isinstance(x, (tuple, list)):
+            return type(x)(self._apply_memory_format(item) for item in x)
+        if isinstance(x, dict):
+            return {k: self._apply_memory_format(v) for k, v in x.items()}
+        return x
 
-        if isinstance(criterion_output, tuple):
-            loss, loss_components = criterion_output
-            # Log individual loss components
-            for component_name, component_value in loss_components.items():
-                self.log(
-                    f"train_{component_name}",
-                    component_value,
-                    on_step=True,
-                    on_epoch=False,
-                    prog_bar=False,
-                    logger=True,
-                )
+    def forward(self, *args, **kwargs) -> Any:
+        """
+        Generic forward pass that accepts any number of arguments.
+        Delegates completely to the underlying model.
+        """
+        args = self._apply_memory_format(args)
+        kwargs = self._apply_memory_format(kwargs)
+        return self.model(*args, **kwargs)
+
+    def _shared_step(
+        self, batch: Tuple[Any, Any], batch_idx: int, prefix: str
+    ) -> torch.Tensor:
+        """
+        Handles data unpacking, forward pass, and loss computation generically.
+        """
+        x, y = batch
+
+        # 1. Dynamic forward pass handling single tensor, tuple, or dict inputs
+        if isinstance(x, (tuple, list)):
+            preds = self(*x)
+        elif isinstance(x, dict):
+            preds = self(**x)
         else:
-            loss = criterion_output
+            preds = self(x)
 
-        self.log(
-            "train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True
-        )
-        return loss
+        # 2. The criterion manages its own expected prediction/target structures
+        criterion_output = self.criterion(preds, y)
 
-    def validation_step(self, batch, batch_idx):
-        noisy, clean = batch
-        reconstructed = self(noisy)
-
-        # Handle both standard losses (single tensor) and composite losses (tuple of tensor and dict)
-        criterion_output = self.criterion(reconstructed, clean)
-
+        # 3. Handle standard vs composite losses transparently
         if isinstance(criterion_output, tuple):
             loss, loss_components = criterion_output
-            # Log individual loss components for validation
             for component_name, component_value in loss_components.items():
                 self.log(
-                    f"val_{component_name}",
+                    f"{prefix}_{component_name}",
                     component_value,
-                    on_step=False,
+                    on_step=(prefix == "train"),
                     on_epoch=True,
                     prog_bar=False,
                     logger=True,
@@ -285,32 +299,77 @@ class RestorationModule(L.LightningModule):
         else:
             loss = criterion_output
 
-        self.log("val_loss", loss, on_epoch=True, prog_bar=True, logger=True)
+        self.log(
+            f"{prefix}_loss",
+            loss,
+            on_step=(prefix == "train"),
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
 
-        # Log images only for the very first batch of validation
+        return loss, x, y, preds
+
+    def training_step(self, batch: Tuple[Any, Any], batch_idx: int) -> torch.Tensor:
+        loss, _, _, _ = self._shared_step(batch, batch_idx, prefix="train")
+        return loss
+
+    def validation_step(self, batch: Tuple[Any, Any], batch_idx: int) -> torch.Tensor:
+        loss, x, y, preds = self._shared_step(batch, batch_idx, prefix="val")
+
+        # Delegate visualization to a separate method that can be overridden
         if batch_idx == 0:
-            # Take the first sample from the batch (index 0)
-            # Add an extra dimension to keep the shape as [1, C, H, W]
-            n_img = noisy[0:1].detach().cpu()
-            r_img = reconstructed[0:1].detach().cpu()
-            c_img = clean[0:1].detach().cpu()
+            self.log_validation_visuals(x, y, preds)
 
-            # Concatenate the three states along the batch dimension
-            # Resulting shape: [3, C, H, W]
+        return loss
+
+    def log_validation_visuals(self, x: Any, y: Any, preds: Any):
+        """
+        Task-specific visual logging.
+        Override this method in a subclass or leave empty if handled by Callbacks.
+        Below is the specific implementation for the audio masking task.
+        """
+        try:
+            noisy_comp_mag = x[0]
+
+            # Extract real and imaginary predictions to reconstruct visual magnitude
+            pred_real = preds[0]
+            pred_imag = preds[1]
+            pred_comp_mag = torch.abs(torch.complex(pred_real, pred_imag))
+
+            clean_wav = y
+
+            n_img = noisy_comp_mag[0:1].detach().cpu()
+            r_img = pred_comp_mag[0:1].detach().cpu()
+
+            c_wav_sample = clean_wav[0:1]
+            window = torch.hann_window(1024).to(c_wav_sample.device)
+            c_stft = torch.stft(
+                c_wav_sample,
+                n_fft=1024,
+                hop_length=256,
+                win_length=1024,
+                window=window,
+                return_complex=True,
+                center=True,
+            )
+            c_mag = torch.abs(c_stft)
+            c_comp_mag = torch.clamp(c_mag, min=1e-8) ** 0.3
+
+            c_img = c_comp_mag.detach().cpu()
+            if c_img.dim() == 3:
+                c_img = c_img.unsqueeze(1)
+
             comparison_tensor = torch.cat([n_img, r_img, c_img], dim=0)
-
-            # Create a side-by-side grid
-            # normalize=True automatically scales values to [0, 1] for correct rendering,
-            # which is extremely useful for audio spectrograms with raw dB values
             grid = torchvision.utils.make_grid(
                 comparison_tensor, nrow=3, normalize=True
             )
-
-            # We save this grid to a class variable so that it can be logged in the on_validation_epoch_end hook
-            # This allows us to log the new image only if there is an improvement in validation loss
             self._val_image_cache = grid
 
-        return loss
+        except Exception:
+            # Silently fail or log a warning if the data shapes don't match audio expectations
+            # This ensures the module doesn't crash if used for a standard image task
+            pass
 
     def on_validation_epoch_end(self):
         current_val_loss = self.trainer.callback_metrics.get("val_loss")
@@ -318,16 +377,10 @@ class RestorationModule(L.LightningModule):
         if current_val_loss is not None:
             current_val_loss = current_val_loss.item()
 
-            if not hasattr(self, "best_val_loss"):
-                self.best_val_loss = float("inf")
-
-            if current_val_loss < self.best_val_loss:
+            if getattr(self, "best_val_loss", float("inf")) > current_val_loss:
                 self.best_val_loss = current_val_loss
 
-                if (
-                    hasattr(self, "_val_image_cache")
-                    and self._val_image_cache is not None
-                ):
+                if getattr(self, "_val_image_cache", None) is not None:
                     self.logger.experiment.add_image(
                         "Validation: 1.Noisy | 2.Reconstructed | 3.Clean",
                         self._val_image_cache,
@@ -336,10 +389,7 @@ class RestorationModule(L.LightningModule):
                     self._val_image_cache = None
 
     def configure_optimizers(self):
-        # Standard Adam optimizer for general convergence stability
         optimizer = optim.Adam(self.parameters(), lr=self.hparams.lr, fused=True)
-
-        # Learning rate scheduler to fine-tune final epochs
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="min",
