@@ -206,7 +206,7 @@ class AudioRestorer:
         )
 
         # 6. RECONSTRUCTION EXPERIMENTS
-        print("Reconstructing waveform variations (Inverse STFT)...")
+        print("Reconstructing waveform variations (Inverse STFT & Griffin-Lim)...")
 
         # Helper function for generating audio from mag and phase
         def reconstruct_audio(magnitude, phase):
@@ -232,8 +232,33 @@ class AudioRestorer:
                 wav = (wav / max_val) * 0.99
             return wav.cpu()
 
-        # Test A: The Phase Bottleneck (Clean Mag + Noisy Phase)
-        audio_a = reconstruct_audio(clean_mag, noisy_phase)
+        # Helper function for generating audio using Griffin-Lim
+        griffin_lim_transform = T.GriffinLim(
+            n_fft=self.n_fft,
+            n_iter=128,
+            win_length=self.win_length,
+            hop_length=self.hop_length,
+            power=1.0,  # Linear magnitude
+            momentum=0.99,
+            length=original_length,
+        ).to(self.device)
+
+        def reconstruct_audio_griffin_lim(magnitude):
+            wav = griffin_lim_transform(magnitude)
+
+            # DC Blocker: High-pass filter at 40 Hz.
+            wav = F_audio.highpass_biquad(
+                wav, sample_rate=self.sample_rate, cutoff_freq=40.0
+            )
+
+            max_val = torch.max(torch.abs(wav))
+            if max_val > 1.0:
+                # Scale down to 0.99 to ensure no hard clipping on playback
+                wav = (wav / max_val) * 0.99
+            return wav.cpu()
+
+        # Test A: The Griffin-Lim Baseline (Clean Mag + Griffin-Lim Phase)
+        audio_a = reconstruct_audio_griffin_lim(clean_mag)
 
         # Test B: Oracle Target (Pred Mag + Clean Phase)
         audio_b = reconstruct_audio(pred_mag, clean_phase)
@@ -241,12 +266,12 @@ class AudioRestorer:
         # Test C: THE ACTUAL SYSTEM OUTPUT (Pred Mag + PRED Phase)
         audio_c = reconstruct_audio(pred_mag, pred_phase)
 
-        # Test D: The Old Reality (Pred Mag + Noisy Phase - for comparison)
-        audio_d = reconstruct_audio(pred_mag, noisy_phase)
+        # Test D: The Griffin-Lim Reality (Pred Mag + Griffin-Lim Phase)
+        audio_d = reconstruct_audio_griffin_lim(pred_mag)
 
         # 7. Save all variations in the output directory
         torchaudio.save(
-            os.path.join(output_dir, "test_A_cleanMag_noisyPhase.wav"),
+            os.path.join(output_dir, "test_A_cleanMag_griffinLim.wav"),
             audio_a,
             self.sample_rate,
         )
@@ -261,7 +286,7 @@ class AudioRestorer:
             self.sample_rate,
         )
         torchaudio.save(
-            os.path.join(output_dir, "test_D_predMag_noisyPhase.wav"),
+            os.path.join(output_dir, "test_D_predMag_griffinLim.wav"),
             audio_d,
             self.sample_rate,
         )
