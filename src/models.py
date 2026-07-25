@@ -1,11 +1,10 @@
-from typing import Any, Tuple, Union
+from typing import Any
 
 import pytorch_lightning as L
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
 import torchvision
+from torch import nn, optim
 
 
 class DoubleConv(nn.Module):
@@ -19,7 +18,7 @@ class DoubleConv(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: Union[int, Tuple[int, int]] = 3,
+        kernel_size: int | tuple[int, int] = 3,
     ):
         super().__init__()
 
@@ -66,7 +65,7 @@ class DownBlock(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: Union[int, Tuple[int, int]] = 3,
+        kernel_size: int | tuple[int, int] = 3,
     ):
         super().__init__()
         self.maxpool_conv = nn.Sequential(
@@ -88,7 +87,7 @@ class UpBlock(nn.Module):
         in_channels: int,
         out_channels: int,
         bilinear: bool = False,
-        kernel_size: Union[int, Tuple[int, int]] = 3,
+        kernel_size: int | tuple[int, int] = 3,
     ):
         super().__init__()
         # If bilinear, use standard upsample and halve the input channels of Conv
@@ -131,7 +130,7 @@ class UNet(nn.Module):
         out_channels: int,
         base_features: int = 64,
         bilinear: bool = False,
-        kernel_size: Union[int, Tuple[int, int]] = 3,
+        kernel_size: int | tuple[int, int] = 3,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -194,7 +193,7 @@ class ComplexRatioMaskingDenoiser(nn.Module):
 
     def forward(
         self, noisy_comp_mag: torch.Tensor, noisy_phase: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # 1. Convert polar coordinates (magnitude, phase) to Cartesian (real, imaginary)
         # We do this directly in the compressed domain for numerical stability
         noisy_real = noisy_comp_mag * torch.cos(noisy_phase)
@@ -266,7 +265,7 @@ class RestorationModule(L.LightningModule):
         return self.model(*args, **kwargs)
 
     def _shared_step(
-        self, batch: Tuple[Any, Any], batch_idx: int, prefix: str
+        self, batch: tuple[Any, Any], batch_idx: int, prefix: str
     ) -> torch.Tensor:
         """
         Handles data unpacking, forward pass, and loss computation generically.
@@ -310,11 +309,11 @@ class RestorationModule(L.LightningModule):
 
         return loss, x, y, preds
 
-    def training_step(self, batch: Tuple[Any, Any], batch_idx: int) -> torch.Tensor:
+    def training_step(self, batch: tuple[Any, Any], batch_idx: int) -> torch.Tensor:
         loss, _, _, _ = self._shared_step(batch, batch_idx, prefix="train")
         return loss
 
-    def validation_step(self, batch: Tuple[Any, Any], batch_idx: int) -> torch.Tensor:
+    def validation_step(self, batch: tuple[Any, Any], batch_idx: int) -> torch.Tensor:
         loss, x, y, preds = self._shared_step(batch, batch_idx, prefix="val")
 
         # Delegate visualization for the first batch of validation
@@ -411,7 +410,7 @@ class RestorationModule(L.LightningModule):
             self._val_image_cache = None
 
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=self.hparams.lr, fused=True)
+        optimizer = optim.Adam(self.parameters(), lr=self.hparams.lr, fused=False)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="min",
