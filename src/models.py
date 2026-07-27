@@ -3,7 +3,6 @@ from typing import Any
 import pytorch_lightning as L
 import torch
 import torch.nn.functional as F
-import torchvision
 from torch import nn, optim
 
 
@@ -419,82 +418,17 @@ class RestorationModule(L.LightningModule):
         loss, _, _, _ = self._shared_step(batch, batch_idx, prefix="train")
         return loss
 
-    def validation_step(self, batch: tuple[Any, Any], batch_idx: int) -> torch.Tensor:
-        loss, x, y, preds = self._shared_step(batch, batch_idx, prefix="val")
+    def validation_step(self, batch: tuple[Any, Any], batch_idx: int) -> dict:
+        loss, _, _, preds = self._shared_step(batch, batch_idx, prefix="val")
 
-        # Delegate visualization for the first batch of validation
+        # Return detached predictions only for the first batch to avoid OOM
+        # The callback will retrieve these via outputs.get("preds")
         if batch_idx == 0:
-            self.log_validation_visuals(x, y, preds)
+            return {"loss": loss, "preds": preds.detach()}
 
-        return loss
-
-    def log_validation_visuals(self, x: Any, y: Any, preds: Any):
-        """
-        Task-specific visual logging. Generates a 3-panel comparison:
-        1. Noisy Input Spectrogram
-        2. Reconstructed Spectrogram
-        3. Clean Reference Target Spectrogram
-        """
-        try:
-            # 1. Unpack and reshape noisy input magnitude
-            noisy_comp_mag = x[0] if isinstance(x, (tuple, list)) else x
-            n_img = noisy_comp_mag[0:1].detach().cpu()
-            if n_img.dim() == 3:
-                n_img = n_img.unsqueeze(1)  # Ensure shape [1, 1, Freq, Time]
-
-            # 2. Extract real and imaginary predictions to compute magnitude
-            if isinstance(preds, (tuple, list)):
-                pred_real, pred_imag = preds[0], preds[1]
-                pred_comp_mag = torch.abs(torch.complex(pred_real, pred_imag))
-            else:
-                pred_comp_mag = preds
-
-            r_img = pred_comp_mag[0:1].detach().cpu()
-            if r_img.dim() == 3:
-                r_img = r_img.unsqueeze(1)  # Ensure shape [1, 1, Freq, Time]
-
-            # 3. Compute clean reference target spectrogram
-            clean_wav = y
-            c_wav_sample = clean_wav[0:1].detach()
-
-            # Ensure 2D tensor [Batch, Time] for STFT
-            if c_wav_sample.dim() == 3:
-                c_wav_sample = c_wav_sample.squeeze(1)
-
-            window = torch.hann_window(1024).to(c_wav_sample.device)
-            c_stft = torch.stft(
-                c_wav_sample,
-                n_fft=1024,
-                hop_length=256,
-                win_length=1024,
-                window=window,
-                return_complex=True,
-                center=True,
-            )
-            c_mag = torch.abs(c_stft)
-            c_comp_mag = torch.clamp(c_mag, min=1e-8) ** 0.3
-
-            c_img = c_comp_mag.cpu()
-            if c_img.dim() == 3:
-                c_img = c_img.unsqueeze(1)  # Ensure shape [1, 1, Freq, Time]
-
-            # Flip frequency axis vertically so low frequencies stay at the bottom of the grid
-            n_img = torch.flip(n_img, dims=[-2])
-            r_img = torch.flip(r_img, dims=[-2])
-            c_img = torch.flip(c_img, dims=[-2])
-
-            # Concatenate images horizontally into a 3-column grid
-            comparison_tensor = torch.cat([n_img, r_img, c_img], dim=0)
-            grid = torchvision.utils.make_grid(
-                comparison_tensor, nrow=3, normalize=True
-            )
-            self._val_image_cache = grid
-
-        except Exception as e:
-            print(f"[Warning] Failed to generate validation visuals: {e}")
+        return {"loss": loss}
 
     def on_validation_epoch_end(self):
-        # Avoid logging metrics/images during Lightning sanity check steps
         if self.trainer.sanity_checking:
             return
 
@@ -504,16 +438,6 @@ class RestorationModule(L.LightningModule):
             current_val_loss = current_val_loss.item()
             if getattr(self, "best_val_loss", float("inf")) > current_val_loss:
                 self.best_val_loss = current_val_loss
-
-        # Log cached visual comparison grid at the end of every validation epoch
-        if getattr(self, "_val_image_cache", None) is not None:
-            if self.logger and hasattr(self.logger.experiment, "add_image"):
-                self.logger.experiment.add_image(
-                    "Validation: 1.Noisy | 2.Reconstructed | 3.Clean",
-                    self._val_image_cache,
-                    global_step=self.global_step,
-                )
-            self._val_image_cache = None
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.hparams.lr, fused=False)

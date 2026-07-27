@@ -8,6 +8,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 
+from callbacks.spectrogram_logging import SpectrogramVisualizerCallback
 from datasets.voices import RIRDataModule
 from losses.audio import CompositeDereverberationLoss
 from models import ComplexSpectralMappingDenoiser, RestorationModule, UNet
@@ -115,12 +116,14 @@ def main(
         save_last=True,
     )
 
+    spectrogram_callback = SpectrogramVisualizerCallback()
+
     trainer = L.Trainer(
         accelerator="cuda",
         devices=1,
         precision="bf16-mixed",
         max_epochs=500,
-        callbacks=[early_stop_callback, checkpoint_callback],
+        callbacks=[early_stop_callback, checkpoint_callback, spectrogram_callback],
         logger=logger,
         log_every_n_steps=10,
         gradient_clip_val=1.0,
