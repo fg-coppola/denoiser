@@ -118,9 +118,21 @@ class ApplyRIR:
             )
 
         rir_map = self._sample_rir_map()
+
+        # 1. Find the direct path delay
+        # This represents the exact sample where the direct sound wave hits the microphone.
+        delay = torch.argmax(torch.abs(rir_map)).item()
+
+        # 2. Perform the full convolution to ensure physical causality
         noisy_waveform = torchaudio.functional.fftconvolve(
             waveform,
             rir_map,
-            mode="same",
+            mode="full",
         )
+
+        # 3. Perfect alignment truncation
+        # Slicing from the 'delay' index perfectly aligns the noisy waveform
+        # with the clean target in the time domain, which is crucial for time-domain losses.
+        noisy_waveform = noisy_waveform[delay : delay + waveform.shape[-1]]
+
         return torch.clamp(noisy_waveform, -1.0, 1.0)
