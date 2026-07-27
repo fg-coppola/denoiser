@@ -9,6 +9,7 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from datasets.voices import RIRDataModule
+from losses.audio import CompositeDereverberationLoss
 from models import ComplexSpectralMappingDenoiser, RestorationModule, UNet
 
 
@@ -69,14 +70,7 @@ def main(
     logger = TensorBoardLogger(save_dir=logs_dir, name=experiment_name)
 
     # STFT parameters must match exactly those used in the data loader's STFTFeatureExtractor
-    criterion = ComplexDereverberationLoss(
-        original_n_fft=1024,
-        original_hop=256,
-        original_win=1024,
-        compression_factor=0.3,
-        lambda_time=1.0,
-        lambda_mr_stft=1.0,
-    )
+    criterion = CompositeDereverberationLoss()
 
     unet = UNet(
         in_channels=2,
