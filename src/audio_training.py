@@ -1,4 +1,5 @@
 import argparse
+import math
 from pathlib import Path
 
 import pytorch_lightning as L
@@ -8,8 +9,33 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from datasets.voices import RIRDataModule
-from losses.audio import ComplexDereverberationLoss
-from models import ComplexRatioMaskingDenoiser, RestorationModule, UNet
+
+
+def compute_accumulation_steps(
+    target_effective_batch: int, micro_batch_size: int = 8
+) -> int:
+    """
+    Calculates the required gradient accumulation steps for a fixed dataloader batch size.
+    Uses ceiling division to ensure the effective batch size is at least the target.
+    """
+    accumulation_steps = math.ceil(target_effective_batch / micro_batch_size)
+
+    # Calculate what the actual effective batch size will be
+    actual_effective = micro_batch_size * accumulation_steps
+
+    if actual_effective != target_effective_batch:
+        print(
+            f"Warning: Target batch size {target_effective_batch} is not a multiple of {micro_batch_size}."
+        )
+        print(
+            f"Adjusted effective batch size to: {actual_effective} ({micro_batch_size} * {accumulation_steps} steps)"
+        )
+    else:
+        print(
+            f"Effective batch size: {actual_effective} ({micro_batch_size} * {accumulation_steps} steps)"
+        )
+
+    return accumulation_steps
 
 
 def main(
@@ -22,6 +48,14 @@ def main(
     # Setup high precision for matrix multiplication
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
+
+    # This is the actual batch size that will be used in the DataLoader.
+    # The effective batch size will be this multiplied by the accumulation steps.
+    fixed_micro_batch = 8
+    # Calculate how many steps we need to accumulate to reach the target
+    accum_steps = compute_accumulation_steps(
+        target_effective_batch=batch_size, micro_batch_size=fixed_micro_batch
+    )
 
     # Define and create output directories
     base_dir = Path(output_folder)
@@ -61,7 +95,7 @@ def main(
         rir_maps=None,
         subset=training_subset,
         download=True,
-        batch_size=batch_size,
+        batch_size=fixed_micro_batch,
         num_workers=4,
         persistent_workers=True,
         pin_memory=True,
@@ -95,6 +129,7 @@ def main(
         log_every_n_steps=10,
         gradient_clip_val=1.0,
         gradient_clip_algorithm="norm",
+        accumulate_grad_batches=accum_steps,
     )
 
     # Check for existing checkpoint to resume training
