@@ -9,7 +9,7 @@ import torchaudio
 import torchaudio.functional as F_audio
 import torchaudio.transforms as T
 
-from models import ComplexSpectralMappingDenoiser, RestorationModule, UNet
+from models import ComplexIRMDenoiser, RestorationModule, UNet
 
 
 class AudioRestorer:
@@ -35,7 +35,7 @@ class AudioRestorer:
             base_features=base_features,
             # kernel_size=(11, 5),
         )
-        complex_denoiser = ComplexSpectralMappingDenoiser(base_model=unet)
+        complex_denoiser = ComplexIRMDenoiser(base_model=unet)
         self.model = RestorationModule.load_from_checkpoint(
             checkpoint_path, model=complex_denoiser, strict=False
         )

@@ -11,7 +11,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from callbacks.spectrogram_logging import SpectrogramVisualizerCallback
 from datasets.voices import RIRDataModule
 from losses.audio import CompositeDereverberationLoss
-from models import ComplexSpectralMappingDenoiser, RestorationModule, UNet
+from models import ComplexIRMDenoiser, RestorationModule, UNet
 
 
 def compute_accumulation_steps(
@@ -70,8 +70,9 @@ def main(
 
     logger = TensorBoardLogger(save_dir=logs_dir, name=experiment_name)
 
-    # STFT parameters must match exactly those used in the data loader's STFTFeatureExtractor
-    criterion = CompositeDereverberationLoss()
+    criterion = CompositeDereverberationLoss(
+        lambda_mr_stft=1.0, lambda_sdr=1.0, compression_factor=0.3
+    )
 
     unet = UNet(
         in_channels=2,
@@ -79,7 +80,7 @@ def main(
         base_features=base_features,
         upsample_mode="bilinear",
     )
-    spectral_denoiser = ComplexSpectralMappingDenoiser(base_model=unet)
+    spectral_denoiser = ComplexIRMDenoiser(base_model=unet)
     rir_model = RestorationModule(
         model=spectral_denoiser,
         loss_fn=criterion,

@@ -322,6 +322,78 @@ class ComplexSpectralMappingDenoiser(nn.Module):
         return pred_real, pred_imag
 
 
+class ComplexIRMDenoiser(nn.Module):
+    """
+    Wrapper for a U-Net model to perform dereverberation via Complex Ideal Ratio Mask (cIRM).
+    Predicts a complex mask that is element-wise multiplied with the noisy input.
+    Designed as a direct drop-in replacement for ComplexSpectralMappingDenoiser.
+    """
+
+    def __init__(self, base_model: nn.Module):
+        super().__init__()
+        self.unet = base_model
+        self._init_mask_to_identity()
+
+    def _init_mask_to_identity(self):
+        """
+        Initializes the output layer so the initial prediction acts as an identity mask
+        (mask_real = 1.0, mask_imag = 0.0). This ensures the initial prediction
+        returns the unaltered input (output = input * 1).
+        """
+        with torch.no_grad():
+            self.unet.outc.weight.zero_()
+            if self.unet.outc.bias is not None:
+                self.unet.outc.bias.zero_()
+                # Set the bias for the real part (channel 0) to 1.0
+                self.unet.outc.bias[0] = 1.0
+
+    def forward(
+        self, noisy_comp_mag: torch.Tensor, noisy_phase: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        # Isolate the Nyquist bin (the last frequency bin)
+        nyquist_mag = noisy_comp_mag[:, :, -1:, :]
+        nyquist_phase = noisy_phase[:, :, -1:, :]
+
+        # Drop the Nyquist bin to get a power-of-2 dimension (e.g., 512) for the U-Net
+        truncated_mag = noisy_comp_mag[:, :, :-1, :]
+        truncated_phase = noisy_phase[:, :, :-1, :]
+
+        # Convert the truncated input to Cartesian coordinates
+        noisy_real = truncated_mag * torch.cos(truncated_phase)
+        noisy_imag = truncated_mag * torch.sin(truncated_phase)
+
+        # Concatenate along the channel dimension -> Shape: [B, 2, F-1, T]
+        x = torch.cat([noisy_real, noisy_imag], dim=1)
+
+        # Predict the complex mask using the base U-Net
+        mask = self.unet(x)
+        mask_real = mask[:, 0:1, :, :]
+        # Clone to avoid in-place operations affecting autograd later
+        mask_imag = mask[:, 1:2, :, :].clone()
+
+        # Enforce Hermitian Symmetry for the DC bin (f=0)
+        # The imaginary part of the mask at DC must be strictly zero.
+        mask_imag[:, :, 0, :] = 0.0
+
+        # Apply the complex Ideal Ratio Mask (cIRM) via complex multiplication
+        # Formula: S = Y * M -> (Y_r + jY_i) * (M_r + jM_i)
+        # S_real = (Y_r * M_r) - (Y_i * M_i)
+        # S_imag = (Y_r * M_i) + (Y_i * M_r)
+        pred_real = (noisy_real * mask_real) - (noisy_imag * mask_imag)
+        pred_imag = (noisy_real * mask_imag) + (noisy_imag * mask_real)
+
+        # We set the reconstructed Nyquist bin to zero
+        nyquist_real_clean = torch.zeros_like(nyquist_mag)
+        nyquist_imag_clean = torch.zeros_like(nyquist_phase)
+
+        # Re-attach the zeroed Nyquist bin along the frequency dimension (dim=2)
+        pred_real = torch.cat([pred_real, nyquist_real_clean], dim=2)
+        pred_imag = torch.cat([pred_imag, nyquist_imag_clean], dim=2)
+
+        return pred_real, pred_imag
+
+
 class RestorationModule(L.LightningModule):
     """
     Generic LightningModule wrapper for signal/image restoration tasks.
