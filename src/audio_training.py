@@ -81,6 +81,7 @@ def main(
         in_channels=2,
         out_channels=2,
         base_features=base_features,
+        upsample_mode="bilinear",
     )
     ratio_denoiser = ComplexRatioMaskingDenoiser(base_model=unet)
     rir_model = RestorationModule(
