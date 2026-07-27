@@ -9,6 +9,7 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from datasets.voices import RIRDataModule
+from models import ComplexSpectralMappingDenoiser, RestorationModule, UNet
 
 
 def compute_accumulation_steps(
@@ -83,9 +84,9 @@ def main(
         base_features=base_features,
         upsample_mode="bilinear",
     )
-    ratio_denoiser = ComplexRatioMaskingDenoiser(base_model=unet)
+    spectral_denoiser = ComplexSpectralMappingDenoiser(base_model=unet)
     rir_model = RestorationModule(
-        model=ratio_denoiser,
+        model=spectral_denoiser,
         loss_fn=criterion,
         lr=1e-4,
     )

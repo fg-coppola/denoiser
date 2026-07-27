@@ -1,7 +1,6 @@
 import argparse
 import os
 from pathlib import Path
-from typing import Optional, Tuple
 
 import matplotlib.pyplot as plt
 import torch
@@ -10,7 +9,7 @@ import torchaudio
 import torchaudio.functional as F_audio
 import torchaudio.transforms as T
 
-from models import ComplexRatioMaskingDenoiser, RestorationModule, UNet
+from models import ComplexSpectralMappingDenoiser, RestorationModule, UNet
 
 
 class AudioRestorer:
@@ -36,7 +35,7 @@ class AudioRestorer:
             base_features=base_features,
             # kernel_size=(11, 5),
         )
-        complex_denoiser = ComplexRatioMaskingDenoiser(base_model=unet)
+        complex_denoiser = ComplexSpectralMappingDenoiser(base_model=unet)
         self.model = RestorationModule.load_from_checkpoint(
             checkpoint_path, model=complex_denoiser, strict=False
         )
@@ -53,7 +52,7 @@ class AudioRestorer:
 
         self.window = torch.hann_window(self.win_length).to(self.device)
 
-    def _pad_for_unet(self, spec: torch.Tensor) -> Tuple[torch.Tensor, int]:
+    def _pad_for_unet(self, spec: torch.Tensor) -> tuple[torch.Tensor, int]:
         time_frames = spec.shape[-1]
         pad_amount = (16 - (time_frames % 16)) % 16
 
@@ -84,7 +83,7 @@ class AudioRestorer:
         noisy_spec: torch.Tensor,
         restored_spec: torch.Tensor,
         output_path: str,
-        reference_spec: Optional[torch.Tensor] = None,
+        reference_spec: torch.Tensor | None = None,
     ):
         """Generates and saves a side-by-side comparison image of the spectrograms."""
         num_plots = 3 if reference_spec is not None else 2
