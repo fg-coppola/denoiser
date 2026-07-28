@@ -329,9 +329,11 @@ class ComplexIRMDenoiser(nn.Module):
     Designed as a direct drop-in replacement for ComplexSpectralMappingDenoiser.
     """
 
-    def __init__(self, base_model: nn.Module):
+    def __init__(self, base_model: nn.Module, mask_bound: float = 10.0):
         super().__init__()
         self.unet = base_model
+        # Define the bounding limit for the tanh activation
+        self.mask_bound = mask_bound
         self._init_mask_to_identity()
 
     def _init_mask_to_identity(self):
@@ -344,8 +346,12 @@ class ComplexIRMDenoiser(nn.Module):
             self.unet.outc.weight.zero_()
             if self.unet.outc.bias is not None:
                 self.unet.outc.bias.zero_()
-                # Set the bias for the real part (channel 0) to 1.0
-                self.unet.outc.bias[0] = 1.0
+
+                # Inverse of the scaled tanh to ensure the final output is 1.0
+                # mask_bound * tanh(x / mask_bound) = 1.0 => x = mask_bound * atanh(1.0 / mask_bound)
+                target_val = torch.tensor(1.0 / self.mask_bound)
+                initial_bias = self.mask_bound * torch.atanh(target_val)
+                self.unet.outc.bias[0] = initial_bias.item()
 
     def forward(
         self, noisy_comp_mag: torch.Tensor, noisy_phase: torch.Tensor
@@ -368,6 +374,8 @@ class ComplexIRMDenoiser(nn.Module):
 
         # Predict the complex mask using the base U-Net
         mask = self.unet(x)
+
+        # Split the mask into real and imaginary parts
         mask_real = mask[:, 0:1, :, :]
         # Clone to avoid in-place operations affecting autograd later
         mask_imag = mask[:, 1:2, :, :].clone()
@@ -375,6 +383,11 @@ class ComplexIRMDenoiser(nn.Module):
         # Enforce Hermitian Symmetry for the DC bin (f=0)
         # The imaginary part of the mask at DC must be strictly zero.
         mask_imag[:, :, 0, :] = 0.0
+
+        # Apply a scaled tanh activation to bound the mask values.
+        # This prevents exploding gradients and reduces spectral artifacts.
+        mask_real = self.mask_bound * torch.tanh(mask_real / self.mask_bound)
+        mask_imag = self.mask_bound * torch.tanh(mask_imag / self.mask_bound)
 
         # Apply the complex Ideal Ratio Mask (cIRM) via complex multiplication
         # Formula: S = Y * M -> (Y_r + jY_i) * (M_r + jM_i)
@@ -496,7 +509,7 @@ class RestorationModule(L.LightningModule):
         # Return detached predictions only for the first batch to avoid OOM
         # The callback will retrieve these via outputs.get("preds")
         if batch_idx == 0:
-            return {"loss": loss, "preds": preds.detach()}
+            return {"loss": loss, "preds": preds}
 
         return {"loss": loss}
 
