@@ -1,6 +1,6 @@
 from typing import Any
 
-import lightning as L
+import pytorch_lightning as L
 import torch
 import torchvision
 
