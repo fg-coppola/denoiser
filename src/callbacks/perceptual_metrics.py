@@ -1,4 +1,4 @@
-import lightning as L
+import pytorch_lightning as L
 import torch
 from torchmetrics.audio import (
     PerceptualEvaluationSpeechQuality,
@@ -36,7 +36,7 @@ class PerceptualMetricsCallback(L.Callback):
         if batch_idx >= self.num_val_batches:
             return
 
-        # Unpack the batch (adjust variable names if your dataset returns them differently)
+        # Unpack the batch
         noisy_audio, clean_audio = batch
 
         # Ensure we don't track gradients for metric calculation
