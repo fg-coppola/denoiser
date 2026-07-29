@@ -1,115 +1,102 @@
 import random
 from pathlib import Path
 
-import numpy as np
-import pyroomacoustics as pra
 import torch
 import torchaudio
-from scipy import signal
 
 
 class ApplyRIR:
-    @staticmethod
-    def _generate_robust_synthetic_rir(target_sr=16000):
-        room_dims = [
-            np.random.uniform(3.0, 8.0),
-            np.random.uniform(4.0, 10.0),
-            np.random.uniform(2.5, 3.5),
-        ]
-        absorption = np.random.uniform(0.15, 0.45)
-
-        room = pra.ShoeBox(
-            room_dims,
-            fs=target_sr,
-            materials=pra.Material(absorption),
-            max_order=15,
-        )
-        source_pos = [
-            np.random.uniform(0.5, room_dims[0] - 0.5),
-            np.random.uniform(0.5, room_dims[1] - 0.5),
-            1.5,
-        ]
-        mic_pos = [
-            np.random.uniform(0.5, room_dims[0] - 0.5),
-            np.random.uniform(0.5, room_dims[1] - 0.5),
-            1.5,
-        ]
-
-        room.add_source(source_pos)
-        room.add_microphone_array(pra.MicrophoneArray(np.array([mic_pos]).T, room.fs))
-        room.compute_rir()
-        raw_rir = room.rir[0][0]
-
-        low_cut_hz = 40.0
-        high_cut_hz = 0.85 * (target_sr / 2.0)
-        b, a = signal.butter(
-            2,
-            [low_cut_hz, high_cut_hz],
-            btype="bandpass",
-            fs=target_sr,
-        )
-        colored_rir = signal.lfilter(b, a, raw_rir)
-        noise_floor = np.random.normal(0, 1e-4, size=len(colored_rir))
-        final_rir = colored_rir + noise_floor
-
-        max_abs = np.max(np.abs(final_rir))
-        if max_abs > 0:
-            final_rir = final_rir / max_abs
-
-        return torch.tensor(final_rir, dtype=torch.float32)
-
-    def __init__(self, rir_maps=None, target_sr=16000):
+    def __init__(
+        self,
+        synthetic_rir_paths=None,
+        real_rir_paths=None,
+        synthetic_prob=0.5,
+        target_sr=16000,
+        max_rir_len_sec=1.5,
+    ):
         self.target_sr = target_sr
-        self.use_synthetic_rir = rir_maps is None
+        self.synthetic_prob = synthetic_prob
+        self.max_rir_len_sec = max_rir_len_sec
+        self.max_samples = int(target_sr * max_rir_len_sec) if max_rir_len_sec else None
 
-        if self.use_synthetic_rir:
-            self.rir_maps = []
-            return
-
-        if isinstance(rir_maps, (torch.Tensor, np.ndarray, str, Path)):
-            rir_maps = [rir_maps]
-        else:
-            rir_maps = list(rir_maps)
-
-        if not rir_maps:
-            raise ValueError("rir_maps must contain at least one room impulse response")
-
-        self.rir_maps = [self._load_rir_map(rir_map) for rir_map in rir_maps]
-
-    def _load_rir_map(self, rir_map):
-        if isinstance(rir_map, torch.Tensor):
-            return rir_map
-
-        if isinstance(rir_map, np.ndarray):
-            return torch.from_numpy(rir_map)
-
-        if isinstance(rir_map, (str, Path)):
-            path = Path(rir_map)
-            raise NotImplementedError(
-                f"RIR loading from file is intentionally left as a placeholder for {path}."
-            )
-
-        raise TypeError(
-            "rir_maps must contain tensors, numpy arrays, or file placeholders to be wired in later"
-        )
-
-    def _normalize_rir_map(self, rir_map):
-        if rir_map.ndim == 2:
-            rir_map = rir_map.mean(dim=0)
-
-        if rir_map.ndim != 1:
+        if synthetic_rir_paths is None and real_rir_paths is None:
             raise ValueError(
-                f"RIR must have shape [T] or [C, T], got {tuple(rir_map.shape)}"
+                "At least one of synthetic_rir_paths or real_rir_paths must be provided."
             )
 
-        return rir_map
+        self.synthetic_rir_pool = self._build_pool(synthetic_rir_paths)
+        real_rir_paths_list = self._build_pool(real_rir_paths)
+
+        if not self.synthetic_rir_pool and not real_rir_paths_list:
+            raise ValueError("No valid RIR files found in the provided paths.")
+
+        # Caching in RAM of real RIRs to avoid on-the-fly resampling and disk I/O
+        self.real_rir_cache = []
+        if real_rir_paths_list:
+            print(f"Caching {len(real_rir_paths_list)} real RIRs into RAM...")
+            for path in real_rir_paths_list:
+                rir_tensor = self._load_rir(path)
+                self.real_rir_cache.append(rir_tensor)
+
+    def _build_pool(self, source):
+        if source is None:
+            return []
+
+        if isinstance(source, (str, Path)):
+            source = [source]
+
+        paths = []
+        for s in source:
+            p = Path(s)
+            if p.is_dir():
+                for ext in ("*.pt", "*.wav", "*.flac", "*.ogg"):
+                    paths.extend(p.glob(ext))
+            elif p.is_file():
+                paths.append(p)
+
+        return sorted(paths)
+
+    def _load_rir(self, path):
+        path = Path(path)
+        suffix = path.suffix.lower()
+
+        if suffix == ".pt":
+            # mmap=True acts as a zero-copy read. The tensor is mapped directly
+            # from disk, bypassing standard CPU RAM allocation bottlenecks.
+            rir = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        else:
+            rir, sr = torchaudio.load(str(path))
+            if sr != self.target_sr:
+                rir = torchaudio.functional.resample(rir, sr, self.target_sr)
+
+        if rir.ndim == 2:
+            rir = rir.mean(dim=0)
+
+        if rir.ndim != 1:
+            raise ValueError(
+                f"RIR must have shape [T] or [C, T], got {tuple(rir.shape)}"
+            )
+
+        rir = rir.to(torch.float32)
+
+        if self.max_samples is not None and rir.shape[0] > self.max_samples:
+            rir = rir[: self.max_samples]
+
+        return rir
 
     def _sample_rir_map(self):
-        if self.use_synthetic_rir:
-            return self._generate_robust_synthetic_rir(target_sr=self.target_sr)
+        use_synthetic = random.random() < self.synthetic_prob
 
-        rir_map = self._normalize_rir_map(random.choice(self.rir_maps))
-        return rir_map.to(torch.float32)
+        # Synthetic RIRs are always loaded from disk to avoid caching large datasets in RAM.
+        # While the real ones are cached in RAM to avoid repeated resampling and disk I/O.
+        if use_synthetic and self.synthetic_rir_pool:
+            rir_path = random.choice(self.synthetic_rir_pool)
+            return self._load_rir(rir_path)
+        elif self.real_rir_cache:
+            return random.choice(self.real_rir_cache)
+        else:
+            rir_path = random.choice(self.synthetic_rir_pool)
+            return self._load_rir(rir_path)
 
     def __call__(self, waveform):
         if waveform.ndim != 1:
@@ -119,20 +106,19 @@ class ApplyRIR:
 
         rir_map = self._sample_rir_map()
 
-        # 1. Find the direct path delay
-        # This represents the exact sample where the direct sound wave hits the microphone.
         delay = torch.argmax(torch.abs(rir_map)).item()
 
-        # 2. Perform the full convolution to ensure physical causality
         noisy_waveform = torchaudio.functional.fftconvolve(
             waveform,
             rir_map,
             mode="full",
         )
 
-        # 3. Perfect alignment truncation
-        # Slicing from the 'delay' index perfectly aligns the noisy waveform
-        # with the clean target in the time domain, which is crucial for time-domain losses.
-        noisy_waveform = noisy_waveform[delay : delay + waveform.shape[-1]]
+        end = delay + waveform.shape[-1]
+        noisy_waveform = noisy_waveform[delay:end]
 
-        return torch.clamp(noisy_waveform, -1.0, 1.0)
+        clean_rms = torch.sqrt(torch.mean(waveform**2))
+        noisy_rms = torch.sqrt(torch.mean(noisy_waveform**2)) + 1e-8
+        noisy_waveform = noisy_waveform * (clean_rms / noisy_rms)
+
+        return noisy_waveform
