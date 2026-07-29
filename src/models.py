@@ -462,7 +462,7 @@ class RestorationModule(L.LightningModule):
         """
         x, y = batch
 
-        # 1. Dynamic forward pass handling single tensor, tuple, or dict inputs
+        # 1. Dynamic forward pass handling
         if isinstance(x, (tuple, list)):
             preds = self(*x)
         elif isinstance(x, dict):
@@ -470,32 +470,36 @@ class RestorationModule(L.LightningModule):
         else:
             preds = self(x)
 
-        # 2. The criterion manages its own expected prediction/target structures
+        # 2. Criterion output
         criterion_output = self.criterion(preds, y)
 
-        # 3. Handle standard vs composite losses transparently
+        # 3. Handle standard vs composite losses transparently with grouped TensorBoard logging
         if isinstance(criterion_output, tuple):
             loss, loss_components = criterion_output
+
+            # Log every component dynamically grouped under {prefix}_loss/...
             for component_name, component_value in loss_components.items():
                 self.log(
-                    f"{prefix}_{component_name}",
+                    f"{prefix}_loss/{component_name}",
                     component_value,
                     on_step=(prefix == "train"),
                     on_epoch=True,
-                    prog_bar=False,
+                    prog_bar=(component_name == "total"),
                     logger=True,
+                    sync_dist=(prefix != "train"),  # Just in case for multi GPU
                 )
         else:
             loss = criterion_output
 
-        self.log(
-            f"{prefix}_loss",
-            loss,
-            on_step=(prefix == "train"),
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
+            self.log(
+                f"{prefix}_loss/total",
+                loss,
+                on_step=(prefix == "train"),
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+                sync_dist=(prefix != "train"),
+            )
 
         return loss, x, y, preds
 
@@ -507,17 +511,24 @@ class RestorationModule(L.LightningModule):
         loss, _, _, preds = self._shared_step(batch, batch_idx, prefix="val")
 
         # Return detached predictions only for the first batch to avoid OOM
-        # The callback will retrieve these via outputs.get("preds")
         if batch_idx == 0:
             return {"loss": loss, "preds": preds}
 
         return {"loss": loss}
 
+    def test_step(self, batch: tuple[Any, Any], batch_idx: int) -> dict:
+        """
+        Evaluates the model on the test set.
+        Returns predictions for ALL batches so callbacks can compute metrics.
+        """
+        loss, _, _, preds = self._shared_step(batch, batch_idx, prefix="test")
+        return {"loss": loss, "preds": preds}
+
     def on_validation_epoch_end(self):
         if self.trainer.sanity_checking:
             return
 
-        current_val_loss = self.trainer.callback_metrics.get("val_loss")
+        current_val_loss = self.trainer.callback_metrics.get("val_loss/total")
 
         if current_val_loss is not None:
             current_val_loss = current_val_loss.item()
@@ -530,13 +541,15 @@ class RestorationModule(L.LightningModule):
             optimizer,
             mode="min",
             factor=0.5,
-            patience=5,
+            patience=3,
+            min_lr=1e-6,
         )
 
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_loss",
+                "monitor": "val_loss/total",
+                "interval": "epoch",
             },
         }

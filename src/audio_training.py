@@ -8,6 +8,8 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 
+from callbacks.audio_logging import AudioLoggerCallback
+from callbacks.perceptual_metrics import PerceptualMetricsCallback
 from callbacks.spectrogram_logging import SpectrogramVisualizerCallback
 from datasets.voices import RIRDataModule
 from losses.audio import CompositeDereverberationLoss
@@ -54,7 +56,8 @@ def main(
 
     # This is the actual batch size that will be used in the DataLoader.
     # The effective batch size will be this multiplied by the accumulation steps.
-    fixed_micro_batch = 8
+    max_supported_micro_batch = 32
+    fixed_micro_batch = min(batch_size, max_supported_micro_batch)
     # Calculate how many steps we need to accumulate to reach the target
     accum_steps = compute_accumulation_steps(
         target_effective_batch=batch_size, micro_batch_size=fixed_micro_batch
@@ -68,7 +71,9 @@ def main(
     logs_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    logger = TensorBoardLogger(save_dir=logs_dir, name=experiment_name)
+    logger = TensorBoardLogger(
+        save_dir=logs_dir, name=experiment_name, version="version_0"
+    )
 
     criterion = CompositeDereverberationLoss(
         lambda_mr_stft=1.0, lambda_sdr=1.0, compression_factor=0.3
@@ -81,28 +86,35 @@ def main(
         upsample_mode="bilinear",
     )
     spectral_denoiser = ComplexIRMDenoiser(base_model=unet)
+
+    spectral_denoiser = torch.compile(spectral_denoiser, mode="default", dynamic=True)
+
     rir_model = RestorationModule(
         model=spectral_denoiser,
         loss_fn=criterion,
-        lr=1e-4,
+        lr=2e-4,
     )
 
     rir_loader = RIRDataModule(
-        data_dir="data/libriSpeech",
-        target_duration_seconds=5.0,
-        rir_maps=None,
+        train_data_dir="data/libriSpeech",
+        val_data_dir="data/audio/validation",
+        test_data_dir="data/audio/test",
         subset=training_subset,
+        target_duration_seconds=3.0,
+        synthetic_rir_paths=["data/rir/synthetic/train"],
+        real_rir_paths=["data/rir/real/train"],
+        synthetic_prob=0.5,
         download=True,
         batch_size=fixed_micro_batch,
-        num_workers=4,
+        num_workers=12,
         persistent_workers=True,
         pin_memory=True,
     )
 
     early_stop_callback = EarlyStopping(
-        monitor="val_loss",
-        min_delta=1e-4,
-        patience=10,
+        monitor="val_loss/total",
+        min_delta=0.01,
+        patience=48,
         verbose=True,
         mode="min",
     )
@@ -110,26 +122,37 @@ def main(
     checkpoint_path = checkpoint_dir / experiment_name
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_path,
-        filename="rir-best-{epoch:02d}-{val_loss:.4f}",
-        monitor="val_loss",
+        filename="rir-best-{epoch:02d}-{val_loss/total:.4f}",
+        monitor="val_loss/total",
         mode="min",
         save_top_k=1,
         save_last=True,
     )
 
     spectrogram_callback = SpectrogramVisualizerCallback()
+    audio_callback = AudioLoggerCallback(sample_rate=16000, compression_factor=0.3)
+    perceptual_callback = PerceptualMetricsCallback(
+        sample_rate=16000, compression_factor=0.3, num_batches=5
+    )
 
     trainer = L.Trainer(
         accelerator="cuda",
         devices=1,
         precision="bf16-mixed",
         max_epochs=500,
-        callbacks=[early_stop_callback, checkpoint_callback, spectrogram_callback],
+        callbacks=[
+            early_stop_callback,
+            checkpoint_callback,
+            spectrogram_callback,
+            audio_callback,
+            perceptual_callback,
+        ],
         logger=logger,
-        log_every_n_steps=10,
+        log_every_n_steps=50,
         gradient_clip_val=1.0,
         gradient_clip_algorithm="norm",
         accumulate_grad_batches=accum_steps,
+        val_check_interval=0.25,  # Validate every 25% of an epoch
     )
 
     # Check for existing checkpoint to resume training
@@ -141,6 +164,9 @@ def main(
     else:
         print("Starting training from scratch.")
         trainer.fit(rir_model, datamodule=rir_loader)
+
+    print("Training complete. Running evaluation on the Test set...")
+    trainer.test(rir_model, datamodule=rir_loader, ckpt_path="best")
 
 
 if __name__ == "__main__":
