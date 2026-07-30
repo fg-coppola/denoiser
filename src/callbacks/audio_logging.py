@@ -9,12 +9,26 @@ class AudioLoggerCallback(L.Callback):
     Callback to log validation audio samples to TensorBoard.
     Reconstructs audio using Inverse STFT for Noisy, Reconstructed, and Clean.
     Also includes an "Oracle Phase" version that combines the predicted magnitude with the clean target phase.
+    Assumes inputs are already in linear scale (no power-law compression applied).
     """
 
-    def __init__(self, sample_rate: int = 16000, compression_factor: float = 0.3):
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        n_fft: int = 1024,
+        hop_length: int = 256,
+        win_length: int = 1024,
+    ):
         super().__init__()
         self.sample_rate = sample_rate
-        self.compression_factor = compression_factor
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.win_length = win_length
+
+    def _normalize_peak(self, audio: torch.Tensor) -> torch.Tensor:
+        """Peak-normalize to [-1, 1] to prevent TensorBoard clipping/distortion."""
+        peak = torch.amax(torch.abs(audio), dim=-1, keepdim=True)
+        return audio / (peak + 1e-8)
 
     def on_validation_batch_end(
         self,
@@ -36,99 +50,93 @@ class AudioLoggerCallback(L.Callback):
             return
 
         try:
-            # 1. Extract Noisy Magnitude and Phase (assuming x = (mag, phase))
-            noisy_comp_mag = x[0][0:1] if isinstance(x, (tuple, list)) else x[0:1]
-            noisy_phase = (
-                x[1][0:1]
-                if isinstance(x, (tuple, list)) and len(x) > 1
-                else torch.zeros_like(noisy_comp_mag)
-            )
+            # 1. Extract Noisy Magnitude and Phase
+            # Assuming dataloader yields x as (noisy_mag, noisy_phase)
+            noisy_mag = x[0][0:1]
+            noisy_phase = x[1][0:1]
 
-            # 2. Extract Reconstructed Magnitude and Phase
-            if isinstance(preds, (tuple, list)):
-                pred_real, pred_imag = preds[0][0:1], preds[1][0:1]
-                pred_complex_tensor = torch.complex(pred_real, pred_imag)
-                pred_comp_mag = torch.abs(pred_complex_tensor)
-                pred_phase = torch.angle(pred_complex_tensor)
-            else:
-                pred_comp_mag = preds[0:1]
-                pred_phase = (
-                    noisy_phase  # Fallback to noisy phase if only mag is predicted
-                )
+            # 2. Extract Reconstructed Components
+            # The wrapper returns a tuple of (pred_real, pred_imag)
+            pred_real, pred_imag = preds[0][0:1], preds[1][0:1]
 
-            # 3. De-compress Magnitudes (invert ** 0.3)
-            noisy_linear_mag = torch.clamp(noisy_comp_mag, min=1e-8) ** (
-                1.0 / self.compression_factor
-            )
-            pred_linear_mag = torch.clamp(pred_comp_mag, min=1e-8) ** (
-                1.0 / self.compression_factor
-            )
+            # Build complex tensor directly from the model's Cartesian outputs
+            pred_complex_tensor = torch.complex(pred_real, pred_imag)
 
-            # Extract clean target waveform to get the oracle phase
+            # Extract magnitude strictly for the Oracle Phase reconstruction
+            pred_mag = torch.abs(pred_complex_tensor)
+
+            # 3. Extract Clean Target Waveform and its Perfect Phase
             clean_wav = y[0:1].squeeze(1) if y[0:1].dim() == 3 else y[0:1]
 
             # Setup the window for STFT/iSTFT operations
-            window = torch.hann_window(1024).to(clean_wav.device)
+            window = torch.hann_window(self.win_length).to(clean_wav.device)
 
-            # Compute STFT of the clean target to extract the perfect oracle phase
             clean_stft = torch.stft(
                 clean_wav,
-                n_fft=1024,
-                hop_length=256,
-                win_length=1024,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
                 window=window,
                 return_complex=True,
                 center=True,
             )
             clean_phase = torch.angle(clean_stft)
 
-            # Match dimensions if necessary (e.g., if pred_linear_mag has channel dim)
-            if pred_linear_mag.dim() == 4:
+            # Match channel dimension if pred_mag has it (e.g., [1, 1, Freq, Time])
+            if pred_mag.dim() == 4:
                 clean_phase = clean_phase.unsqueeze(1)
 
-            # 4. Build Complex Spectrograms
-            noisy_complex = noisy_linear_mag * torch.exp(1j * noisy_phase)
-            pred_complex = pred_linear_mag * torch.exp(1j * pred_phase)
-
-            # Build Oracle Complex Spectrogram (Predicted Mag + Clean Phase)
-            oracle_complex = pred_linear_mag * torch.exp(1j * clean_phase)
+            # 4. Build Complex Spectrograms for iSTFT
+            noisy_complex = torch.polar(noisy_mag, noisy_phase)
+            pred_complex = pred_complex_tensor  # Already built above
+            oracle_complex = torch.polar(pred_mag, clean_phase)
 
             # Squeeze channel dim for iSTFT: [1, 1, Freq, Time] -> [1, Freq, Time]
             if noisy_complex.dim() == 4:
                 noisy_complex = noisy_complex.squeeze(1)
+            if pred_complex.dim() == 4:
                 pred_complex = pred_complex.squeeze(1)
+            if oracle_complex.dim() == 4:
                 oracle_complex = oracle_complex.squeeze(1)
 
             # 5. Inverse STFT
+            expected_length = clean_wav.shape[-1]
+
             noisy_wav = torch.istft(
                 noisy_complex,
-                n_fft=1024,
-                hop_length=256,
-                win_length=1024,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
                 window=window,
                 center=True,
-                length=clean_wav.shape[-1],  # Ensure exact length matching
+                length=expected_length,
             )
             pred_wav = torch.istft(
                 pred_complex,
-                n_fft=1024,
-                hop_length=256,
-                win_length=1024,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
                 window=window,
                 center=True,
-                length=clean_wav.shape[-1],  # Ensure exact length matching
+                length=expected_length,
             )
             oracle_wav = torch.istft(
                 oracle_complex,
-                n_fft=1024,
-                hop_length=256,
-                win_length=1024,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
                 window=window,
                 center=True,
-                length=clean_wav.shape[-1],  # Ensure exact length matching
+                length=expected_length,
             )
 
-            # 6. Log to TensorBoard
+            # 6. Normalize all waveforms to prevent TensorBoard distortion
+            noisy_wav = self._normalize_peak(noisy_wav)
+            pred_wav = self._normalize_peak(pred_wav)
+            oracle_wav = self._normalize_peak(oracle_wav)
+            clean_wav = self._normalize_peak(clean_wav)
+
+            # 7. Log to TensorBoard
             if trainer.logger and hasattr(trainer.logger.experiment, "add_audio"):
                 tb = trainer.logger.experiment
                 global_step = trainer.global_step

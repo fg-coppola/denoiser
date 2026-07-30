@@ -9,7 +9,13 @@ class SpectrogramVisualizerCallback(L.Callback):
     """
     Callback to log validation spectrogram visuals to TensorBoard.
     Generates a 3-panel comparison: Noisy, Reconstructed, and Clean.
+    Applies power-law compression purely for visualization purposes so that
+    lower energy frequencies are visible.
     """
+
+    def __init__(self, compression_factor: float = 0.3):
+        super().__init__()
+        self.compression_factor = compression_factor
 
     def on_validation_batch_end(
         self,
@@ -32,20 +38,27 @@ class SpectrogramVisualizerCallback(L.Callback):
             return
 
         try:
-            # 1. Unpack and reshape noisy input magnitude
-            noisy_comp_mag = x[0] if isinstance(x, (tuple, list)) else x
-            n_img = noisy_comp_mag[0:1].detach().cpu()
+            # 1. Unpack noisy input magnitude (currently linear)
+            noisy_mag = x[0] if isinstance(x, (tuple, list)) else x
+
+            # Apply compression ONLY for visualization
+            noisy_viz_mag = torch.clamp(noisy_mag, min=1e-8) ** self.compression_factor
+
+            n_img = noisy_viz_mag[0:1].detach().cpu()
             if n_img.dim() == 3:
                 n_img = n_img.unsqueeze(1)  # Ensure shape [1, 1, Freq, Time]
 
-            # 2. Extract real and imaginary predictions to compute magnitude
+            # 2. Extract real and imaginary predictions to compute magnitude (currently linear)
             if isinstance(preds, (tuple, list)):
                 pred_real, pred_imag = preds[0], preds[1]
-                pred_comp_mag = torch.abs(torch.complex(pred_real, pred_imag))
+                pred_mag = torch.abs(torch.complex(pred_real, pred_imag))
             else:
-                pred_comp_mag = preds
+                pred_mag = preds
 
-            r_img = pred_comp_mag[0:1].detach().cpu()
+            # Apply compression ONLY for visualization
+            pred_viz_mag = torch.clamp(pred_mag, min=1e-8) ** self.compression_factor
+
+            r_img = pred_viz_mag[0:1].detach().cpu()
             if r_img.dim() == 3:
                 r_img = r_img.unsqueeze(1)  # Ensure shape [1, 1, Freq, Time]
 
@@ -68,9 +81,11 @@ class SpectrogramVisualizerCallback(L.Callback):
                 center=True,
             )
             c_mag = torch.abs(c_stft)
-            c_comp_mag = torch.clamp(c_mag, min=1e-8) ** 0.3
 
-            c_img = c_comp_mag.cpu()
+            # Apply compression ONLY for visualization
+            c_viz_mag = torch.clamp(c_mag, min=1e-8) ** self.compression_factor
+
+            c_img = c_viz_mag.cpu()
             if c_img.dim() == 3:
                 c_img = c_img.unsqueeze(1)  # Ensure shape [1, 1, Freq, Time]
 

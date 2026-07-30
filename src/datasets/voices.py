@@ -283,7 +283,7 @@ class RIRDataModule(BaseDataModule):
         self.noisy_feature_transform = transforms.Compose(
             [
                 STFTFeatureExtractor(),
-                PowerLawCompression(),
+                # PowerLawCompression(),
             ]
         )
 

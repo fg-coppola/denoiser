@@ -1,5 +1,6 @@
 import argparse
 import math
+import os
 from pathlib import Path
 
 import pytorch_lightning as L
@@ -12,8 +13,8 @@ from callbacks.audio_logging import AudioLoggerCallback
 from callbacks.perceptual_metrics import PerceptualMetricsCallback
 from callbacks.spectrogram_logging import SpectrogramVisualizerCallback
 from datasets.voices import RIRDataModule
-from losses.audio import CompositeDereverberationLoss
-from models import ComplexIRMDenoiser, RestorationModule, UNet
+from losses.audio import MagnitudeOnlyDereverberationLoss
+from models import MagnitudeIRMNoisyPhaseDenoiser, RestorationModule, UNet
 
 
 def compute_accumulation_steps(
@@ -79,17 +80,15 @@ def main(
         save_dir=logs_dir, name=experiment_name, version="version_0"
     )
 
-    criterion = CompositeDereverberationLoss(
-        lambda_mr_stft=1.0, lambda_sdr=1.0, compression_factor=0.3
-    )
+    criterion = MagnitudeOnlyDereverberationLoss()
 
     unet = UNet(
-        in_channels=2,
-        out_channels=2,
+        in_channels=1,
+        out_channels=1,
         base_features=base_features,
         upsample_mode="bilinear",
     )
-    spectral_denoiser = ComplexIRMDenoiser(base_model=unet)
+    spectral_denoiser = MagnitudeIRMNoisyPhaseDenoiser(base_model=unet)
 
     spectral_denoiser = torch.compile(spectral_denoiser, mode="default", dynamic=True)
 
@@ -134,7 +133,7 @@ def main(
     )
 
     spectrogram_callback = SpectrogramVisualizerCallback()
-    audio_callback = AudioLoggerCallback(sample_rate=16000, compression_factor=0.3)
+    audio_callback = AudioLoggerCallback(sample_rate=16000)
     perceptual_callback = PerceptualMetricsCallback(
         sample_rate=16000, num_val_batches=5
     )
@@ -171,7 +170,11 @@ def main(
         trainer.fit(rir_model, datamodule=rir_loader)
 
     print("Training complete. Running evaluation on the Test set...")
-    trainer.test(rir_model, datamodule=rir_loader, ckpt_path="best")
+    trainer.test(
+        rir_model,
+        datamodule=rir_loader,
+        ckpt_path="artifacts/checkpoints/rir_mr-stft-loss_train-clean-100_mixed_32_masking_v47/rir-best-epoch=30.ckpt",
+    )
 
 
 if __name__ == "__main__":
