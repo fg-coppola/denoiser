@@ -8,14 +8,16 @@ from torchmetrics.audio import (
 
 class PerceptualMetricsCallback(L.Callback):
     """
-    Validation and Test callback that computes PESQ and STOI for model predictions,
-    noisy baseline, and an oracle scenario (Predicted Magnitude + Clean Phase).
-    Logs the metrics, deltas, and test variance/std across the entire dataset.
+    Validation and Test callback that computes PESQ and STOI for model predictions
+    and compares them against static baseline scores passed at initialization.
+    Computes an oracle scenario (Predicted Magnitude + Clean Phase) solely during testing.
     Assumes inputs are in linear scale (no power-law compression).
     """
 
     def __init__(
         self,
+        test_pesq_baseline: float,
+        test_stoi_baseline: float,
         sample_rate: int = 16000,
         num_val_batches: int = 5,
         n_fft: int = 1024,
@@ -23,6 +25,8 @@ class PerceptualMetricsCallback(L.Callback):
         win_length: int = 1024,
     ):
         super().__init__()
+        self.test_pesq_baseline = test_pesq_baseline
+        self.test_stoi_baseline = test_stoi_baseline
         self.sample_rate = sample_rate
         self.num_val_batches = num_val_batches
         self.n_fft = n_fft
@@ -32,51 +36,21 @@ class PerceptualMetricsCallback(L.Callback):
         # Validation metrics (stateful accumulators)
         self.pesq = PerceptualEvaluationSpeechQuality(sample_rate, "wb")
         self.stoi = ShortTimeObjectiveIntelligibility(sample_rate, False)
-        self.base_pesq = PerceptualEvaluationSpeechQuality(sample_rate, "wb")
-        self.base_stoi = ShortTimeObjectiveIntelligibility(sample_rate, False)
 
         # Test metric containers for full-run tracking, mean, and variance calculation
         self.test_pesq_scores = []
         self.test_stoi_scores = []
-        self.test_base_pesq_scores = []
-        self.test_base_stoi_scores = []
         self.test_oracle_mag_pesq_scores = []
         self.test_oracle_mag_stoi_scores = []
 
         # Temporary single-sample metric calculators for testing collection
         self._test_pesq_metric = PerceptualEvaluationSpeechQuality(sample_rate, "wb")
         self._test_stoi_metric = ShortTimeObjectiveIntelligibility(sample_rate, False)
-        self._test_base_pesq_metric = PerceptualEvaluationSpeechQuality(
-            sample_rate, "wb"
-        )
-        self._test_base_stoi_metric = ShortTimeObjectiveIntelligibility(
-            sample_rate, False
-        )
         self._test_oracle_mag_pesq_metric = PerceptualEvaluationSpeechQuality(
             sample_rate, "wb"
         )
         self._test_oracle_mag_stoi_metric = ShortTimeObjectiveIntelligibility(
             sample_rate, False
-        )
-
-    def _reconstruct_noisy(
-        self,
-        mag: torch.Tensor,
-        phase: torch.Tensor,
-        length: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Convert linear magnitude and phase back to time domain via iSTFT."""
-        complex_spec = torch.polar(mag, phase).squeeze(1)
-        window = torch.hann_window(self.win_length, device=device)
-        return torch.istft(
-            complex_spec,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            window=window,
-            center=True,
-            length=length,
         )
 
     def _normalize_peak(self, audio: torch.Tensor) -> torch.Tensor:
@@ -103,8 +77,6 @@ class PerceptualMetricsCallback(L.Callback):
         if expected_length < int(0.25 * self.sample_rate):
             return
 
-        noisy_mag, noisy_phase = noisy_inputs
-
         with torch.no_grad():
             preds_real, preds_imag = pl_module(*noisy_inputs)
             pred_complex = torch.complex(preds_real, preds_imag).squeeze(1)
@@ -122,18 +94,11 @@ class PerceptualMetricsCallback(L.Callback):
                 length=expected_length,
             )
 
-            noisy_audio = self._reconstruct_noisy(
-                noisy_mag, noisy_phase, expected_length, device
-            )
-
         pred_audio = self._normalize_peak(pred_audio.detach().cpu().float())
-        noisy_audio = self._normalize_peak(noisy_audio.detach().cpu().float())
         clean_audio = self._normalize_peak(clean_audio.detach().cpu().float())
 
         self.pesq(pred_audio, clean_audio)
         self.stoi(pred_audio, clean_audio)
-        self.base_pesq(noisy_audio, clean_audio)
-        self.base_stoi(noisy_audio, clean_audio)
 
     def on_validation_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule):
         if trainer.sanity_checking:
@@ -142,25 +107,14 @@ class PerceptualMetricsCallback(L.Callback):
         try:
             pred_pesq = self.pesq.compute()
             pred_stoi = self.stoi.compute()
-            base_pesq = self.base_pesq.compute()
-            base_stoi = self.base_stoi.compute()
         except RuntimeError:
             return
         finally:
             self.pesq.reset()
             self.stoi.reset()
-            self.base_pesq.reset()
-            self.base_stoi.reset()
-
-        delta_pesq = pred_pesq - base_pesq
-        delta_stoi = pred_stoi - base_stoi
 
         pl_module.log("val/pesq", pred_pesq, prog_bar=True, sync_dist=True)
         pl_module.log("val/stoi", pred_stoi, prog_bar=True, sync_dist=True)
-        pl_module.log("val/baseline_pesq", base_pesq, sync_dist=True)
-        pl_module.log("val/baseline_stoi", base_stoi, sync_dist=True)
-        pl_module.log("val/delta_pesq", delta_pesq, prog_bar=True, sync_dist=True)
-        pl_module.log("val/delta_stoi", delta_stoi, prog_bar=True, sync_dist=True)
 
     def on_test_batch_end(
         self,
@@ -178,8 +132,6 @@ class PerceptualMetricsCallback(L.Callback):
 
         if expected_length < int(0.25 * self.sample_rate):
             return
-
-        noisy_mag, noisy_phase = noisy_inputs
 
         with torch.no_grad():
             preds_real, preds_imag = pl_module(*noisy_inputs)
@@ -200,12 +152,7 @@ class PerceptualMetricsCallback(L.Callback):
                 length=expected_length,
             )
 
-            # 2. Noisy Baseline Reconstruction
-            noisy_audio = self._reconstruct_noisy(
-                noisy_mag, noisy_phase, expected_length, device
-            )
-
-            # 3. Oracle Magnitude Reconstruction (Pred Mag + Clean Phase)
+            # 2. Oracle Magnitude Reconstruction (Pred Mag + Clean Phase)
             clean_stft = torch.stft(
                 clean_audio,
                 n_fft=self.n_fft,
@@ -230,15 +177,12 @@ class PerceptualMetricsCallback(L.Callback):
 
         # Peak normalization on CPU
         pred_audio = self._normalize_peak(pred_audio.detach().cpu().float())
-        noisy_audio = self._normalize_peak(noisy_audio.detach().cpu().float())
         oracle_mag_audio = self._normalize_peak(oracle_mag_audio.detach().cpu().float())
         clean_audio = self._normalize_peak(clean_audio.detach().cpu().float())
 
         # Compute metrics per individual sample for variance tracking
         p_score = self._test_pesq_metric(pred_audio, clean_audio).item()
         s_score = self._test_stoi_metric(pred_audio, clean_audio).item()
-        bp_score = self._test_base_pesq_metric(noisy_audio, clean_audio).item()
-        bs_score = self._test_base_stoi_metric(noisy_audio, clean_audio).item()
         op_score = self._test_oracle_mag_pesq_metric(
             oracle_mag_audio, clean_audio
         ).item()
@@ -248,16 +192,12 @@ class PerceptualMetricsCallback(L.Callback):
 
         self.test_pesq_scores.append(p_score)
         self.test_stoi_scores.append(s_score)
-        self.test_base_pesq_scores.append(bp_score)
-        self.test_base_stoi_scores.append(bs_score)
         self.test_oracle_mag_pesq_scores.append(op_score)
         self.test_oracle_mag_stoi_scores.append(os_score)
 
         # Reset temporary metric instances for the next sample
         self._test_pesq_metric.reset()
         self._test_stoi_metric.reset()
-        self._test_base_pesq_metric.reset()
-        self._test_base_stoi_metric.reset()
         self._test_oracle_mag_pesq_metric.reset()
         self._test_oracle_mag_stoi_metric.reset()
 
@@ -269,16 +209,12 @@ class PerceptualMetricsCallback(L.Callback):
         # Convert lists to tensors for statistical analysis
         pesq_t = torch.tensor(self.test_pesq_scores)
         stoi_t = torch.tensor(self.test_stoi_scores)
-        b_pesq_t = torch.tensor(self.test_base_pesq_scores)
-        b_stoi_t = torch.tensor(self.test_base_stoi_scores)
         op_pesq_t = torch.tensor(self.test_oracle_mag_pesq_scores)
         op_stoi_t = torch.tensor(self.test_oracle_mag_stoi_scores)
 
         # Compute means
         mean_pesq = pesq_t.mean().item()
         mean_stoi = stoi_t.mean().item()
-        mean_base_pesq = b_pesq_t.mean().item()
-        mean_base_stoi = b_stoi_t.mean().item()
         mean_oracle_mag_pesq = op_pesq_t.mean().item()
         mean_oracle_mag_stoi = op_stoi_t.mean().item()
 
@@ -295,8 +231,8 @@ class PerceptualMetricsCallback(L.Callback):
         var_oracle_mag_stoi = op_stoi_t.var(unbiased=True).item()
         std_oracle_mag_stoi = op_stoi_t.std(unbiased=True).item()
 
-        delta_pesq = mean_pesq - mean_base_pesq
-        delta_stoi = mean_stoi - mean_base_stoi
+        delta_pesq = mean_pesq - self.pesq_baseline
+        delta_stoi = mean_stoi - self.stoi_baseline
 
         # Log final aggregated test metrics and distribution stats
         pl_module.log("test/pesq", mean_pesq, sync_dist=True)
@@ -307,8 +243,8 @@ class PerceptualMetricsCallback(L.Callback):
         pl_module.log("test/stoi_var", var_stoi, sync_dist=True)
         pl_module.log("test/stoi_std", std_stoi, sync_dist=True)
 
-        pl_module.log("test/baseline_pesq", mean_base_pesq, sync_dist=True)
-        pl_module.log("test/baseline_stoi", mean_base_stoi, sync_dist=True)
+        pl_module.log("test/baseline_pesq", self.pesq_baseline, sync_dist=True)
+        pl_module.log("test/baseline_stoi", self.stoi_baseline, sync_dist=True)
 
         pl_module.log("test/delta_pesq", delta_pesq, sync_dist=True)
         pl_module.log("test/delta_stoi", delta_stoi, sync_dist=True)
@@ -325,7 +261,5 @@ class PerceptualMetricsCallback(L.Callback):
         # Clear lists for safety
         self.test_pesq_scores.clear()
         self.test_stoi_scores.clear()
-        self.test_base_pesq_scores.clear()
-        self.test_base_stoi_scores.clear()
         self.test_oracle_mag_pesq_scores.clear()
         self.test_oracle_mag_stoi_scores.clear()

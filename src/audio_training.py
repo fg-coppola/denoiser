@@ -137,7 +137,10 @@ def main(
     spectrogram_callback = SpectrogramVisualizerCallback()
     audio_callback = AudioLoggerCallback(sample_rate=16000, save_dir=audio_dir)
     perceptual_callback = PerceptualMetricsCallback(
-        sample_rate=16000, num_val_batches=5
+        test_pesq_baseline=1.6975412368774414,
+        test_stoi_baseline=0.7496239542961121,
+        sample_rate=16000,
+        num_val_batches=5,
     )
 
     trainer = L.Trainer(
