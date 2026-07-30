@@ -50,13 +50,17 @@ def main(
     batch_size: int = 24,
     base_features: int = 32,
 ):
+    # Force the cache directory into a local folder within the project
+    cache_dir = os.path.abspath("./.torch_compile_cache")
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+
     # Setup high precision for matrix multiplication
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
 
     # This is the actual batch size that will be used in the DataLoader.
     # The effective batch size will be this multiplied by the accumulation steps.
-    max_supported_micro_batch = 32
+    max_supported_micro_batch = 64
     fixed_micro_batch = min(batch_size, max_supported_micro_batch)
     # Calculate how many steps we need to accumulate to reach the target
     accum_steps = compute_accumulation_steps(
@@ -114,7 +118,7 @@ def main(
     early_stop_callback = EarlyStopping(
         monitor="val_loss/total",
         min_delta=0.01,
-        patience=48,
+        patience=10,
         verbose=True,
         mode="min",
     )
@@ -122,7 +126,7 @@ def main(
     checkpoint_path = checkpoint_dir / experiment_name
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_path,
-        filename="rir-best-{epoch:02d}-{val_loss/total:.4f}",
+        filename="rir-best-{epoch:02d}",
         monitor="val_loss/total",
         mode="min",
         save_top_k=1,
@@ -152,7 +156,8 @@ def main(
         gradient_clip_val=1.0,
         gradient_clip_algorithm="norm",
         accumulate_grad_batches=accum_steps,
-        val_check_interval=0.25,  # Validate every 25% of an epoch
+        # val_check_interval=0.25,  # Validate every 25% of an epoch
+        limit_train_batches=0.5,  # Use 50% of the training data
     )
 
     # Check for existing checkpoint to resume training
