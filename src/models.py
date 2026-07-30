@@ -396,13 +396,67 @@ class ComplexIRMDenoiser(nn.Module):
         pred_real = (noisy_real * mask_real) - (noisy_imag * mask_imag)
         pred_imag = (noisy_real * mask_imag) + (noisy_imag * mask_real)
 
-        # We set the reconstructed Nyquist bin to zero
-        nyquist_real_clean = torch.zeros_like(nyquist_mag)
-        nyquist_imag_clean = torch.zeros_like(nyquist_phase)
+        # We set the reconstructed Nyquist bin to polar coordinates
+        nyquist_real = nyquist_mag * torch.cos(nyquist_phase)
+        nyquist_imag = nyquist_mag * torch.sin(nyquist_phase)
 
-        # Re-attach the zeroed Nyquist bin along the frequency dimension (dim=2)
-        pred_real = torch.cat([pred_real, nyquist_real_clean], dim=2)
-        pred_imag = torch.cat([pred_imag, nyquist_imag_clean], dim=2)
+        # Re-attach the Nyquist bin along the frequency dimension (dim=2)
+        pred_real = torch.cat([pred_real, nyquist_real], dim=2)
+        pred_imag = torch.cat([pred_imag, nyquist_imag], dim=2)
+
+        return pred_real, pred_imag
+
+
+class DirectSpectralDenoiser(nn.Module):
+    """
+    Wrapper for a U-Net model to perform direct audio dereverberation.
+    Predicts the clean real and imaginary parts directly from the noisy input,
+    without using any intermediate ratio masks.
+    Designed as a direct drop-in replacement for ComplexIRMDenoiser.
+    """
+
+    def __init__(self, base_model: nn.Module):
+        super().__init__()
+        self.unet = base_model
+
+    def forward(
+        self, noisy_comp_mag: torch.Tensor, noisy_phase: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        # Isolate the Nyquist bin (the last frequency bin)
+        nyquist_mag = noisy_comp_mag[:, :, -1:, :]
+        nyquist_phase = noisy_phase[:, :, -1:, :]
+
+        # Drop the Nyquist bin to get a power-of-2 dimension (e.g., 512) for the U-Net
+        truncated_mag = noisy_comp_mag[:, :, :-1, :]
+        truncated_phase = noisy_phase[:, :, :-1, :]
+
+        # Convert the truncated input to Cartesian coordinates
+        noisy_real = truncated_mag * torch.cos(truncated_phase)
+        noisy_imag = truncated_mag * torch.sin(truncated_phase)
+
+        # Concatenate along the channel dimension -> Shape: [B, 2, F-1, T]
+        x = torch.cat([noisy_real, noisy_imag], dim=1)
+
+        # The U-Net predicts the clean real and imaginary parts directly
+        pred = self.unet(x)
+
+        # Split the prediction into real and imaginary parts
+        pred_real_trunc = pred[:, 0:1, :, :]
+        # Clone to avoid in-place operations affecting autograd later
+        pred_imag_trunc = pred[:, 1:2, :, :].clone()
+
+        # Enforce Hermitian Symmetry for the DC bin (f=0)
+        # The imaginary part of the mask at DC must be strictly zero.
+        pred_imag_trunc[:, :, 0, :] = 0.0
+
+        # We set the reconstructed Nyquist bin to polar coordinates
+        nyquist_real = nyquist_mag * torch.cos(nyquist_phase)
+        nyquist_imag = nyquist_mag * torch.sin(nyquist_phase)
+
+        # Re-attach the Nyquist bin along the frequency dimension (dim=2)
+        pred_real = torch.cat([pred_real_trunc, nyquist_real], dim=2)
+        pred_imag = torch.cat([pred_imag_trunc, nyquist_imag], dim=2)
 
         return pred_real, pred_imag
 
