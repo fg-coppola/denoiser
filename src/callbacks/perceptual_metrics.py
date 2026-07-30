@@ -7,21 +7,58 @@ from torchmetrics.audio import (
 
 
 class PerceptualMetricsCallback(L.Callback):
-    def __init__(self, sample_rate=16000, num_val_batches=5):
+    """
+    Validation callback that computes PESQ and STOI for both model predictions
+    and the noisy baseline, then logs the deltas.
+    """
+
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        num_val_batches: int = 5,
+        n_fft: int = 1024,
+        hop_length: int = 256,
+        power_law_factor: float = 0.3,
+    ):
         super().__init__()
         self.sample_rate = sample_rate
-        # We limit the validation to a few batches because PESQ/STOI on CPU are very slow
         self.num_val_batches = num_val_batches
+        self.power_law_factor = power_law_factor
+        self.n_fft = n_fft
+        self.hop_length = hop_length
 
-        # Initialize metrics (wideband 'wb' is standard for 16kHz audio)
-        self.pesq_metric = PerceptualEvaluationSpeechQuality(sample_rate, "wb")
-        self.stoi_metric = ShortTimeObjectiveIntelligibility(sample_rate, False)
+        # Model metrics
+        self.pesq = PerceptualEvaluationSpeechQuality(sample_rate, "wb")
+        self.stoi = ShortTimeObjectiveIntelligibility(sample_rate, False)
 
-        # Lists to store batch scores during validation
-        self.val_pesq_scores = []
-        self.val_stoi_scores = []
-        self.val_base_pesq = []
-        self.val_base_stoi = []
+        # Baseline metrics (noisy vs clean)
+        self.base_pesq = PerceptualEvaluationSpeechQuality(sample_rate, "wb")
+        self.base_stoi = ShortTimeObjectiveIntelligibility(sample_rate, False)
+
+    def _reconstruct_noisy(
+        self,
+        comp_mag: torch.Tensor,
+        phase: torch.Tensor,
+        length: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Decompress magnitude and convert back to time domain via iSTFT."""
+        mag = comp_mag ** (1.0 / self.power_law_factor)
+        complex_spec = torch.polar(mag, phase).squeeze(1)
+        window = torch.hann_window(self.n_fft, device=device)
+        return torch.istft(
+            complex_spec,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            window=window,
+            center=True,
+            length=length,
+        )
+
+    def _normalize_peak(self, audio: torch.Tensor) -> torch.Tensor:
+        """Peak-normalize to [-1, 1] to keep PESQ in its valid operating range."""
+        peak = torch.amax(torch.abs(audio), dim=-1, keepdim=True)
+        return audio / (peak + 1e-8)
 
     def on_validation_batch_end(
         self,
@@ -29,85 +66,86 @@ class PerceptualMetricsCallback(L.Callback):
         pl_module: L.LightningModule,
         outputs,
         batch,
-        batch_idx,
-        dataloader_idx=0,
+        batch_idx: int,
+        dataloader_idx: int = 0,
     ):
-        # Process only a small subset of validation batches
         if batch_idx >= self.num_val_batches:
             return
 
-        # Unpack the batch
-        noisy_audio, clean_audio = batch
+        noisy_inputs, clean_audio = batch
+        clean_audio = clean_audio.squeeze(1)
+        expected_length = clean_audio.shape[-1]
 
-        # Ensure we don't track gradients for metric calculation
-        with torch.no_grad():
-            # Get model predictions
-            preds = pl_module(noisy_audio)
-
-            # Metrics must be computed on CPU in float32
-            preds = preds.detach().cpu().float()
-            clean = clean_audio.detach().cpu().float()
-            noisy = noisy_audio.detach().cpu().float()
-
-            # Calculate Model metrics (Prediction vs Clean)
-            pred_pesq = self.pesq_metric(preds, clean)
-            pred_stoi = self.stoi_metric(preds, clean)
-
-            # Calculate Baseline metrics (Noisy vs Clean)
-            base_pesq = self.pesq_metric(noisy, clean)
-            base_stoi = self.stoi_metric(noisy, clean)
-
-            # Store the mean of the current batch
-            self.val_pesq_scores.append(pred_pesq.item())
-            self.val_stoi_scores.append(pred_stoi.item())
-            self.val_base_pesq.append(base_pesq.item())
-            self.val_base_stoi.append(base_stoi.item())
-
-    def on_validation_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule):
-        # Skip if sanity check is running or if no scores were collected
-        if trainer.sanity_checking or not self.val_pesq_scores:
+        # PESQ requires at least ~0.25 s of audio
+        if expected_length < int(0.25 * self.sample_rate):
             return
 
-        # 1. Calculate epoch averages
-        avg_pred_pesq = sum(self.val_pesq_scores) / len(self.val_pesq_scores)
-        avg_base_pesq = sum(self.val_base_pesq) / len(self.val_base_pesq)
+        noisy_comp_mag, noisy_phase = noisy_inputs
 
-        avg_pred_stoi = sum(self.val_stoi_scores) / len(self.val_stoi_scores)
-        avg_base_stoi = sum(self.val_base_stoi) / len(self.val_base_stoi)
+        with torch.no_grad():
+            preds_real, preds_imag = pl_module(*noisy_inputs)
+            pred_complex = torch.complex(preds_real, preds_imag).squeeze(1)
 
-        # 2. Calculate the net improvement (Delta)
-        delta_pesq = avg_pred_pesq - avg_base_pesq
-        delta_stoi = avg_pred_stoi - avg_base_stoi
+            device = pred_complex.device
+            window = torch.hann_window(self.n_fft, device=device)
 
-        # 3. MERGED GRAPHS (Safe for any logger)
-        # We try to get the experiment object. If it supports add_scalars (like TensorBoard),
-        # we plot Model and Baseline together in the same graph.
-        experiment = getattr(trainer.logger, "experiment", None)
-
-        if hasattr(experiment, "add_scalars"):
-            # This creates a "Comparison" folder in TensorBoard with the dual-line graphs
-            experiment.add_scalars(
-                "Comparison/PESQ",
-                {"Model": avg_pred_pesq, "Baseline_Noisy": avg_base_pesq},
-                global_step=trainer.global_step,
-            )
-            experiment.add_scalars(
-                "Comparison/STOI",
-                {"Model": avg_pred_stoi, "Baseline_Noisy": avg_base_stoi},
-                global_step=trainer.global_step,
+            pred_audio = torch.istft(
+                pred_complex,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                window=window,
+                center=True,
+                length=expected_length,
             )
 
-        # 4. Standard Logging
-        # We log the model's absolute performance and the Delta.
-        # These work with ANY logger and are saved in the checkpoint.
-        pl_module.log("val/subset_pesq", avg_pred_pesq, prog_bar=True, sync_dist=True)
-        pl_module.log("val/delta_pesq", delta_pesq, sync_dist=True)
+            noisy_audio = self._reconstruct_noisy(
+                noisy_comp_mag, noisy_phase, expected_length, device
+            )
 
-        pl_module.log("val/subset_stoi", avg_pred_stoi, prog_bar=True, sync_dist=True)
-        pl_module.log("val/delta_stoi", delta_stoi, sync_dist=True)
+        # Move to CPU and normalize for metric stability
+        pred_audio = self._normalize_peak(pred_audio.detach().cpu().float())
+        noisy_audio = self._normalize_peak(noisy_audio.detach().cpu().float())
+        clean_audio = self._normalize_peak(clean_audio.detach().cpu().float())
 
-        # 5. Clear lists for the next epoch
-        self.val_pesq_scores.clear()
-        self.val_stoi_scores.clear()
-        self.val_base_pesq.clear()
-        self.val_base_stoi.clear()
+        # Accumulate
+        self.pesq(pred_audio, clean_audio)
+        self.stoi(pred_audio, clean_audio)
+
+        self.base_pesq(noisy_audio, clean_audio)
+        self.base_stoi(noisy_audio, clean_audio)
+
+    def on_validation_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule):
+        if trainer.sanity_checking:
+            return
+
+        try:
+            pred_pesq = self.pesq.compute()
+            pred_stoi = self.stoi.compute()
+
+            base_pesq = self.base_pesq.compute()
+            base_stoi = self.base_stoi.compute()
+        except RuntimeError:
+            # No data accumulated (e.g., all batches too short)
+            return
+        finally:
+            # Always reset to avoid cross-epoch leakage
+            self.pesq.reset()
+            self.stoi.reset()
+            self.base_pesq.reset()
+            self.base_stoi.reset()
+
+        # Compute deltas
+        delta_pesq = pred_pesq - base_pesq
+        delta_stoi = pred_stoi - base_stoi
+
+        # Log model metrics
+        pl_module.log("val/pesq", pred_pesq, prog_bar=True, sync_dist=True)
+        pl_module.log("val/stoi", pred_stoi, prog_bar=True, sync_dist=True)
+
+        # Log baseline metrics
+        pl_module.log("val/baseline_pesq", base_pesq, sync_dist=True)
+        pl_module.log("val/baseline_stoi", base_stoi, sync_dist=True)
+
+        # Log deltas
+        pl_module.log("val/delta_pesq", delta_pesq, prog_bar=True, sync_dist=True)
+        pl_module.log("val/delta_stoi", delta_stoi, prog_bar=True, sync_dist=True)
