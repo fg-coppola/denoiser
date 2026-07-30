@@ -7,21 +7,56 @@ from torchmetrics.audio import (
 
 
 class PerceptualMetricsCallback(L.Callback):
-    def __init__(self, sample_rate=16000, num_val_batches=5):
+    """
+    Validation and Test callback that computes PESQ and STOI for model predictions
+    and compares them against static baseline scores passed at initialization.
+    Computes an oracle scenario (Predicted Magnitude + Clean Phase) solely during testing.
+    Assumes inputs are in linear scale (no power-law compression).
+    """
+
+    def __init__(
+        self,
+        test_pesq_baseline: float,
+        test_stoi_baseline: float,
+        sample_rate: int = 16000,
+        num_val_batches: int = 5,
+        n_fft: int = 1024,
+        hop_length: int = 256,
+        win_length: int = 1024,
+    ):
         super().__init__()
+        self.test_pesq_baseline = test_pesq_baseline
+        self.test_stoi_baseline = test_stoi_baseline
         self.sample_rate = sample_rate
-        # We limit the validation to a few batches because PESQ/STOI on CPU are very slow
         self.num_val_batches = num_val_batches
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.win_length = win_length
 
-        # Initialize metrics (wideband 'wb' is standard for 16kHz audio)
-        self.pesq_metric = PerceptualEvaluationSpeechQuality(sample_rate, "wb")
-        self.stoi_metric = ShortTimeObjectiveIntelligibility(sample_rate, False)
+        # Validation metrics (stateful accumulators)
+        self.pesq = PerceptualEvaluationSpeechQuality(sample_rate, "wb")
+        self.stoi = ShortTimeObjectiveIntelligibility(sample_rate, False)
 
-        # Lists to store batch scores during validation
-        self.val_pesq_scores = []
-        self.val_stoi_scores = []
-        self.val_base_pesq = []
-        self.val_base_stoi = []
+        # Test metric containers for full-run tracking, mean, and variance calculation
+        self.test_pesq_scores = []
+        self.test_stoi_scores = []
+        self.test_oracle_mag_pesq_scores = []
+        self.test_oracle_mag_stoi_scores = []
+
+        # Temporary single-sample metric calculators for testing collection
+        self._test_pesq_metric = PerceptualEvaluationSpeechQuality(sample_rate, "wb")
+        self._test_stoi_metric = ShortTimeObjectiveIntelligibility(sample_rate, False)
+        self._test_oracle_mag_pesq_metric = PerceptualEvaluationSpeechQuality(
+            sample_rate, "wb"
+        )
+        self._test_oracle_mag_stoi_metric = ShortTimeObjectiveIntelligibility(
+            sample_rate, False
+        )
+
+    def _normalize_peak(self, audio: torch.Tensor) -> torch.Tensor:
+        """Peak-normalize to [-1, 1] to keep PESQ in its valid operating range."""
+        peak = torch.amax(torch.abs(audio), dim=-1, keepdim=True)
+        return audio / (peak + 1e-8)
 
     def on_validation_batch_end(
         self,
@@ -29,85 +64,202 @@ class PerceptualMetricsCallback(L.Callback):
         pl_module: L.LightningModule,
         outputs,
         batch,
-        batch_idx,
-        dataloader_idx=0,
+        batch_idx: int,
+        dataloader_idx: int = 0,
     ):
-        # Process only a small subset of validation batches
-        if batch_idx >= self.num_val_batches:
+        if trainer.sanity_checking or batch_idx >= self.num_val_batches:
             return
 
-        # Unpack the batch
-        noisy_audio, clean_audio = batch
+        noisy_inputs, clean_audio = batch
+        clean_audio = clean_audio.squeeze(1)
+        expected_length = clean_audio.shape[-1]
 
-        # Ensure we don't track gradients for metric calculation
+        if expected_length < int(0.25 * self.sample_rate):
+            return
+
         with torch.no_grad():
-            # Get model predictions
-            preds = pl_module(noisy_audio)
+            preds_real, preds_imag = pl_module(*noisy_inputs)
+            pred_complex = torch.complex(preds_real, preds_imag).squeeze(1)
 
-            # Metrics must be computed on CPU in float32
-            preds = preds.detach().cpu().float()
-            clean = clean_audio.detach().cpu().float()
-            noisy = noisy_audio.detach().cpu().float()
+            device = pred_complex.device
+            window = torch.hann_window(self.win_length, device=device)
 
-            # Calculate Model metrics (Prediction vs Clean)
-            pred_pesq = self.pesq_metric(preds, clean)
-            pred_stoi = self.stoi_metric(preds, clean)
+            pred_audio = torch.istft(
+                pred_complex,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+                window=window,
+                center=True,
+                length=expected_length,
+            )
 
-            # Calculate Baseline metrics (Noisy vs Clean)
-            base_pesq = self.pesq_metric(noisy, clean)
-            base_stoi = self.stoi_metric(noisy, clean)
+        pred_audio = self._normalize_peak(pred_audio.detach().cpu().float())
+        clean_audio = self._normalize_peak(clean_audio.detach().cpu().float())
 
-            # Store the mean of the current batch
-            self.val_pesq_scores.append(pred_pesq.item())
-            self.val_stoi_scores.append(pred_stoi.item())
-            self.val_base_pesq.append(base_pesq.item())
-            self.val_base_stoi.append(base_stoi.item())
+        self.pesq(pred_audio, clean_audio)
+        self.stoi(pred_audio, clean_audio)
 
     def on_validation_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule):
-        # Skip if sanity check is running or if no scores were collected
-        if trainer.sanity_checking or not self.val_pesq_scores:
+        if trainer.sanity_checking:
             return
 
-        # 1. Calculate epoch averages
-        avg_pred_pesq = sum(self.val_pesq_scores) / len(self.val_pesq_scores)
-        avg_base_pesq = sum(self.val_base_pesq) / len(self.val_base_pesq)
+        try:
+            pred_pesq = self.pesq.compute()
+            pred_stoi = self.stoi.compute()
+        except RuntimeError:
+            return
+        finally:
+            self.pesq.reset()
+            self.stoi.reset()
 
-        avg_pred_stoi = sum(self.val_stoi_scores) / len(self.val_stoi_scores)
-        avg_base_stoi = sum(self.val_base_stoi) / len(self.val_base_stoi)
+        pl_module.log("val/pesq", pred_pesq, prog_bar=True, sync_dist=True)
+        pl_module.log("val/stoi", pred_stoi, prog_bar=True, sync_dist=True)
 
-        # 2. Calculate the net improvement (Delta)
-        delta_pesq = avg_pred_pesq - avg_base_pesq
-        delta_stoi = avg_pred_stoi - avg_base_stoi
+    def on_test_batch_end(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        outputs,
+        batch,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ):
+        """Process every batch in the test dataset without batch limitations."""
+        noisy_inputs, clean_audio = batch
+        clean_audio = clean_audio.squeeze(1)
+        expected_length = clean_audio.shape[-1]
 
-        # 3. MERGED GRAPHS (Safe for any logger)
-        # We try to get the experiment object. If it supports add_scalars (like TensorBoard),
-        # we plot Model and Baseline together in the same graph.
-        experiment = getattr(trainer.logger, "experiment", None)
+        if expected_length < int(0.25 * self.sample_rate):
+            return
 
-        if hasattr(experiment, "add_scalars"):
-            # This creates a "Comparison" folder in TensorBoard with the dual-line graphs
-            experiment.add_scalars(
-                "Comparison/PESQ",
-                {"Model": avg_pred_pesq, "Baseline_Noisy": avg_base_pesq},
-                global_step=trainer.global_step,
+        with torch.no_grad():
+            preds_real, preds_imag = pl_module(*noisy_inputs)
+            pred_complex = torch.complex(preds_real, preds_imag).squeeze(1)
+            pred_mag = torch.abs(pred_complex)
+
+            device = pred_complex.device
+            window = torch.hann_window(self.win_length, device=device)
+
+            # 1. Standard Model Reconstruction (Pred Mag + Noisy Phase)
+            pred_audio = torch.istft(
+                pred_complex,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+                window=window,
+                center=True,
+                length=expected_length,
             )
-            experiment.add_scalars(
-                "Comparison/STOI",
-                {"Model": avg_pred_stoi, "Baseline_Noisy": avg_base_stoi},
-                global_step=trainer.global_step,
+
+            # 2. Oracle Magnitude Reconstruction (Pred Mag + Clean Phase)
+            clean_stft = torch.stft(
+                clean_audio,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+                window=window,
+                return_complex=True,
+                center=True,
+            )
+            clean_phase = torch.angle(clean_stft)
+
+            oracle_mag_complex = torch.polar(pred_mag, clean_phase)
+            oracle_mag_audio = torch.istft(
+                oracle_mag_complex,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+                window=window,
+                center=True,
+                length=expected_length,
             )
 
-        # 4. Standard Logging
-        # We log the model's absolute performance and the Delta.
-        # These work with ANY logger and are saved in the checkpoint.
-        pl_module.log("val/subset_pesq", avg_pred_pesq, prog_bar=True, sync_dist=True)
-        pl_module.log("val/delta_pesq", delta_pesq, sync_dist=True)
+        # Peak normalization on CPU
+        pred_audio = self._normalize_peak(pred_audio.detach().cpu().float())
+        oracle_mag_audio = self._normalize_peak(oracle_mag_audio.detach().cpu().float())
+        clean_audio = self._normalize_peak(clean_audio.detach().cpu().float())
 
-        pl_module.log("val/subset_stoi", avg_pred_stoi, prog_bar=True, sync_dist=True)
-        pl_module.log("val/delta_stoi", delta_stoi, sync_dist=True)
+        # Compute metrics per individual sample for variance tracking
+        p_score = self._test_pesq_metric(pred_audio, clean_audio).item()
+        s_score = self._test_stoi_metric(pred_audio, clean_audio).item()
+        op_score = self._test_oracle_mag_pesq_metric(
+            oracle_mag_audio, clean_audio
+        ).item()
+        os_score = self._test_oracle_mag_stoi_metric(
+            oracle_mag_audio, clean_audio
+        ).item()
 
-        # 5. Clear lists for the next epoch
-        self.val_pesq_scores.clear()
-        self.val_stoi_scores.clear()
-        self.val_base_pesq.clear()
-        self.val_base_stoi.clear()
+        self.test_pesq_scores.append(p_score)
+        self.test_stoi_scores.append(s_score)
+        self.test_oracle_mag_pesq_scores.append(op_score)
+        self.test_oracle_mag_stoi_scores.append(os_score)
+
+        # Reset temporary metric instances for the next sample
+        self._test_pesq_metric.reset()
+        self._test_stoi_metric.reset()
+        self._test_oracle_mag_pesq_metric.reset()
+        self._test_oracle_mag_stoi_metric.reset()
+
+    def on_test_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule):
+        """Aggregate test scores across all samples, computing mean, variance, and std."""
+        if not self.test_pesq_scores:
+            return
+
+        # Convert lists to tensors for statistical analysis
+        pesq_t = torch.tensor(self.test_pesq_scores)
+        stoi_t = torch.tensor(self.test_stoi_scores)
+        op_pesq_t = torch.tensor(self.test_oracle_mag_pesq_scores)
+        op_stoi_t = torch.tensor(self.test_oracle_mag_stoi_scores)
+
+        # Compute means
+        mean_pesq = pesq_t.mean().item()
+        mean_stoi = stoi_t.mean().item()
+        mean_oracle_mag_pesq = op_pesq_t.mean().item()
+        mean_oracle_mag_stoi = op_stoi_t.mean().item()
+
+        # Compute variances and standard deviations (unbiased estimator: correction=1)
+        var_pesq = pesq_t.var(unbiased=True).item()
+        std_pesq = pesq_t.std(unbiased=True).item()
+
+        var_stoi = stoi_t.var(unbiased=True).item()
+        std_stoi = stoi_t.std(unbiased=True).item()
+
+        var_oracle_mag_pesq = op_pesq_t.var(unbiased=True).item()
+        std_oracle_mag_pesq = op_pesq_t.std(unbiased=True).item()
+
+        var_oracle_mag_stoi = op_stoi_t.var(unbiased=True).item()
+        std_oracle_mag_stoi = op_stoi_t.std(unbiased=True).item()
+
+        delta_pesq = mean_pesq - self.pesq_baseline
+        delta_stoi = mean_stoi - self.stoi_baseline
+
+        # Log final aggregated test metrics and distribution stats
+        pl_module.log("test/pesq", mean_pesq, sync_dist=True)
+        pl_module.log("test/pesq_var", var_pesq, sync_dist=True)
+        pl_module.log("test/pesq_std", std_pesq, sync_dist=True)
+
+        pl_module.log("test/stoi", mean_stoi, sync_dist=True)
+        pl_module.log("test/stoi_var", var_stoi, sync_dist=True)
+        pl_module.log("test/stoi_std", std_stoi, sync_dist=True)
+
+        pl_module.log("test/baseline_pesq", self.pesq_baseline, sync_dist=True)
+        pl_module.log("test/baseline_stoi", self.stoi_baseline, sync_dist=True)
+
+        pl_module.log("test/delta_pesq", delta_pesq, sync_dist=True)
+        pl_module.log("test/delta_stoi", delta_stoi, sync_dist=True)
+
+        # Log Oracle Magnitude metrics (Pred Mag + Clean Phase)
+        pl_module.log("test/oracle_mag_pesq", mean_oracle_mag_pesq, sync_dist=True)
+        pl_module.log("test/oracle_mag_pesq_var", var_oracle_mag_pesq, sync_dist=True)
+        pl_module.log("test/oracle_mag_pesq_std", std_oracle_mag_pesq, sync_dist=True)
+
+        pl_module.log("test/oracle_mag_stoi", mean_oracle_mag_stoi, sync_dist=True)
+        pl_module.log("test/oracle_mag_stoi_var", var_oracle_mag_stoi, sync_dist=True)
+        pl_module.log("test/oracle_mag_stoi_std", std_oracle_mag_stoi, sync_dist=True)
+
+        # Clear lists for safety
+        self.test_pesq_scores.clear()
+        self.test_stoi_scores.clear()
+        self.test_oracle_mag_pesq_scores.clear()
+        self.test_oracle_mag_stoi_scores.clear()

@@ -84,14 +84,9 @@ class STFTFeatureExtractor:
         self.sample_rate = sample_rate
         self.n_fft = n_fft
         self.hop_length = hop_length
+        self.win_length = n_fft
 
-        self.spectrogram = torchaudio.transforms.Spectrogram(
-            n_fft=n_fft,
-            hop_length=hop_length,
-            win_length=n_fft,
-            power=None,  # Returns complex STFT
-            normalized=False,
-        )
+        self.window = torch.hann_window(self.win_length)
 
     def __call__(self, waveform):
         if waveform.ndim != 1:
@@ -99,7 +94,18 @@ class STFTFeatureExtractor:
                 f"Input waveform must have shape [T], got {tuple(waveform.shape)}"
             )
 
-        complex_spec = self.spectrogram(waveform)
+        window = self.window.to(waveform.device)
+
+        complex_spec = torch.stft(
+            waveform,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=window,
+            center=True,
+            return_complex=True,
+        )
+
         mag = torch.abs(complex_spec)
         phase = torch.angle(complex_spec)
 
@@ -277,7 +283,7 @@ class RIRDataModule(BaseDataModule):
         self.noisy_feature_transform = transforms.Compose(
             [
                 STFTFeatureExtractor(),
-                PowerLawCompression(),
+                # PowerLawCompression(),
             ]
         )
 

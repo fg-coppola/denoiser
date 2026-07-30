@@ -1,5 +1,6 @@
 import argparse
 import math
+import os
 from pathlib import Path
 
 import pytorch_lightning as L
@@ -12,8 +13,8 @@ from callbacks.audio_logging import AudioLoggerCallback
 from callbacks.perceptual_metrics import PerceptualMetricsCallback
 from callbacks.spectrogram_logging import SpectrogramVisualizerCallback
 from datasets.voices import RIRDataModule
-from losses.audio import CompositeDereverberationLoss
-from models import ComplexIRMDenoiser, RestorationModule, UNet
+from losses.audio import MagnitudeOnlyDereverberationLoss
+from models import MagnitudeIRMNoisyPhaseDenoiser, RestorationModule, UNet
 
 
 def compute_accumulation_steps(
@@ -50,13 +51,17 @@ def main(
     batch_size: int = 24,
     base_features: int = 32,
 ):
+    # Force the cache directory into a local folder within the project
+    cache_dir = os.path.abspath("./.torch_compile_cache")
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+
     # Setup high precision for matrix multiplication
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
 
     # This is the actual batch size that will be used in the DataLoader.
     # The effective batch size will be this multiplied by the accumulation steps.
-    max_supported_micro_batch = 32
+    max_supported_micro_batch = 64
     fixed_micro_batch = min(batch_size, max_supported_micro_batch)
     # Calculate how many steps we need to accumulate to reach the target
     accum_steps = compute_accumulation_steps(
@@ -67,25 +72,25 @@ def main(
     base_dir = Path(output_folder)
     logs_dir = base_dir / "logs"
     checkpoint_dir = base_dir / "checkpoints"
+    audio_dir = base_dir / "audio"
 
     logs_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    audio_dir.mkdir(parents=True, exist_ok=True)
 
     logger = TensorBoardLogger(
         save_dir=logs_dir, name=experiment_name, version="version_0"
     )
 
-    criterion = CompositeDereverberationLoss(
-        lambda_mr_stft=1.0, lambda_sdr=1.0, compression_factor=0.3
-    )
+    criterion = MagnitudeOnlyDereverberationLoss()
 
     unet = UNet(
-        in_channels=2,
-        out_channels=2,
+        in_channels=1,
+        out_channels=1,
         base_features=base_features,
         upsample_mode="bilinear",
     )
-    spectral_denoiser = ComplexIRMDenoiser(base_model=unet)
+    spectral_denoiser = MagnitudeIRMNoisyPhaseDenoiser(base_model=unet)
 
     spectral_denoiser = torch.compile(spectral_denoiser, mode="default", dynamic=True)
 
@@ -114,7 +119,7 @@ def main(
     early_stop_callback = EarlyStopping(
         monitor="val_loss/total",
         min_delta=0.01,
-        patience=48,
+        patience=10,
         verbose=True,
         mode="min",
     )
@@ -122,7 +127,7 @@ def main(
     checkpoint_path = checkpoint_dir / experiment_name
     checkpoint_callback = ModelCheckpoint(
         dirpath=checkpoint_path,
-        filename="rir-best-{epoch:02d}-{val_loss/total:.4f}",
+        filename="rir-best-{epoch:02d}",
         monitor="val_loss/total",
         mode="min",
         save_top_k=1,
@@ -130,9 +135,12 @@ def main(
     )
 
     spectrogram_callback = SpectrogramVisualizerCallback()
-    audio_callback = AudioLoggerCallback(sample_rate=16000, compression_factor=0.3)
+    audio_callback = AudioLoggerCallback(sample_rate=16000, save_dir=audio_dir)
     perceptual_callback = PerceptualMetricsCallback(
-        sample_rate=16000, num_val_batches=5
+        test_pesq_baseline=1.6975412368774414,
+        test_stoi_baseline=0.7496239542961121,
+        sample_rate=16000,
+        num_val_batches=5,
     )
 
     trainer = L.Trainer(
@@ -152,7 +160,8 @@ def main(
         gradient_clip_val=1.0,
         gradient_clip_algorithm="norm",
         accumulate_grad_batches=accum_steps,
-        val_check_interval=0.25,  # Validate every 25% of an epoch
+        # val_check_interval=0.25,  # Validate every 25% of an epoch
+        limit_train_batches=0.5,  # Use 50% of the training data
     )
 
     # Check for existing checkpoint to resume training
@@ -166,7 +175,11 @@ def main(
         trainer.fit(rir_model, datamodule=rir_loader)
 
     print("Training complete. Running evaluation on the Test set...")
-    trainer.test(rir_model, datamodule=rir_loader, ckpt_path="best")
+    trainer.test(
+        rir_model,
+        datamodule=rir_loader,
+        ckpt_path="artifacts/checkpoints/rir_mr-stft-loss_train-clean-100_mixed_32_masking_v47/rir-best-epoch=30.ckpt",
+    )
 
 
 if __name__ == "__main__":
