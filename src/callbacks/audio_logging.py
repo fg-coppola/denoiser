@@ -8,6 +8,7 @@ class AudioLoggerCallback(L.Callback):
     """
     Callback to log validation audio samples to TensorBoard.
     Reconstructs audio using Inverse STFT for Noisy, Reconstructed, and Clean.
+    Also includes an "Oracle Phase" version that combines the predicted magnitude with the clean target phase.
     """
 
     def __init__(self, sample_rate: int = 16000, compression_factor: float = 0.3):
@@ -63,17 +64,42 @@ class AudioLoggerCallback(L.Callback):
                 1.0 / self.compression_factor
             )
 
+            # Extract clean target waveform to get the oracle phase
+            clean_wav = y[0:1].squeeze(1) if y[0:1].dim() == 3 else y[0:1]
+
+            # Setup the window for STFT/iSTFT operations
+            window = torch.hann_window(1024).to(clean_wav.device)
+
+            # Compute STFT of the clean target to extract the perfect oracle phase
+            clean_stft = torch.stft(
+                clean_wav,
+                n_fft=1024,
+                hop_length=256,
+                win_length=1024,
+                window=window,
+                return_complex=True,
+                center=True,
+            )
+            clean_phase = torch.angle(clean_stft)
+
+            # Match dimensions if necessary (e.g., if pred_linear_mag has channel dim)
+            if pred_linear_mag.dim() == 4:
+                clean_phase = clean_phase.unsqueeze(1)
+
             # 4. Build Complex Spectrograms
             noisy_complex = noisy_linear_mag * torch.exp(1j * noisy_phase)
             pred_complex = pred_linear_mag * torch.exp(1j * pred_phase)
+
+            # Build Oracle Complex Spectrogram (Predicted Mag + Clean Phase)
+            oracle_complex = pred_linear_mag * torch.exp(1j * clean_phase)
 
             # Squeeze channel dim for iSTFT: [1, 1, Freq, Time] -> [1, Freq, Time]
             if noisy_complex.dim() == 4:
                 noisy_complex = noisy_complex.squeeze(1)
                 pred_complex = pred_complex.squeeze(1)
+                oracle_complex = oracle_complex.squeeze(1)
 
             # 5. Inverse STFT
-            window = torch.hann_window(1024).to(noisy_complex.device)
             noisy_wav = torch.istft(
                 noisy_complex,
                 n_fft=1024,
@@ -81,6 +107,7 @@ class AudioLoggerCallback(L.Callback):
                 win_length=1024,
                 window=window,
                 center=True,
+                length=clean_wav.shape[-1],  # Ensure exact length matching
             )
             pred_wav = torch.istft(
                 pred_complex,
@@ -89,10 +116,17 @@ class AudioLoggerCallback(L.Callback):
                 win_length=1024,
                 window=window,
                 center=True,
+                length=clean_wav.shape[-1],  # Ensure exact length matching
             )
-
-            # Clean waveform is directly available from target 'y'
-            clean_wav = y[0:1].squeeze(1) if y[0:1].dim() == 3 else y[0:1]
+            oracle_wav = torch.istft(
+                oracle_complex,
+                n_fft=1024,
+                hop_length=256,
+                win_length=1024,
+                window=window,
+                center=True,
+                length=clean_wav.shape[-1],  # Ensure exact length matching
+            )
 
             # 6. Log to TensorBoard
             if trainer.logger and hasattr(trainer.logger.experiment, "add_audio"):
@@ -113,7 +147,13 @@ class AudioLoggerCallback(L.Callback):
                     self.sample_rate,
                 )
                 tb.add_audio(
-                    "Audio/3_Clean",
+                    "Audio/3_Oracle_Phase",
+                    oracle_wav.squeeze(0).detach().cpu(),
+                    global_step,
+                    self.sample_rate,
+                )
+                tb.add_audio(
+                    "Audio/4_Clean",
                     clean_wav.squeeze(0).detach().cpu(),
                     global_step,
                     self.sample_rate,
