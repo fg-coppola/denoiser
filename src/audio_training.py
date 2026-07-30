@@ -72,9 +72,11 @@ def main(
     base_dir = Path(output_folder)
     logs_dir = base_dir / "logs"
     checkpoint_dir = base_dir / "checkpoints"
+    audio_dir = base_dir / "audio"
 
     logs_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    audio_dir.mkdir(parents=True, exist_ok=True)
 
     logger = TensorBoardLogger(
         save_dir=logs_dir, name=experiment_name, version="version_0"
@@ -133,7 +135,7 @@ def main(
     )
 
     spectrogram_callback = SpectrogramVisualizerCallback()
-    audio_callback = AudioLoggerCallback(sample_rate=16000)
+    audio_callback = AudioLoggerCallback(sample_rate=16000, save_dir=audio_dir)
     perceptual_callback = PerceptualMetricsCallback(
         sample_rate=16000, num_val_batches=5
     )
