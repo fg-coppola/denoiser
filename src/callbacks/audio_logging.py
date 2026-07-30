@@ -44,6 +44,7 @@ class AudioLoggerCallback(L.Callback):
         preds: tuple[torch.Tensor, torch.Tensor],
         batch_idx: int,
         stage: str,
+        dataloader_idx: int = 0,
     ):
         """Unified method to handle STFT reconstruction, TensorBoard logging, and disk saving."""
         try:
@@ -167,18 +168,23 @@ class AudioLoggerCallback(L.Callback):
                     self.sample_rate,
                 )
 
-            # 7. Disk Saving (Progressive numbering)
-            if self.save_dir is not None:
-                if stage == "val":
-                    file_name = f"val_step_{trainer.global_step}.wav"
-                else:
-                    # Formatta l'indice a 4 cifre per ordine alfabetico corretto (es: test_sample_0042.wav)
-                    file_name = f"test_sample_{batch_idx:04d}.wav"
+            # 7. Disk Saving (Only during testing)
+            if self.save_dir is not None and stage == "test":
+                test_loaders = trainer.test_dataloaders
+                current_dataloader = (
+                    test_loaders[dataloader_idx]
+                    if isinstance(test_loaders, list)
+                    else test_loaders
+                )
+                dataset = current_dataloader.dataset
 
-                out_path = self.save_dir / file_name
+                file_stem = dataset.clean_files[batch_idx].stem
+                file_name = f"{file_stem}_recon.wav"
+
+                out_path = self.save_dir / stage / file_name
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+
                 wav_to_save = pred_wav.detach().cpu()
-
-                # torchaudio expected shape: [Channels, Time]
                 if wav_to_save.dim() == 1:
                     wav_to_save = wav_to_save.unsqueeze(0)
 
