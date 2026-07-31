@@ -39,8 +39,8 @@ def compute_accumulation_steps(
 
 def build_default_sources(data_dir: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """
-    Costruisce le liste di sorgenti di default per LOL v1, LOL-v2 Real e LOL-v2 Synthetic
-    basandosi su una cartella principale dei dati.
+    Builds the default source lists for LOL v1, LOL-v2 Real, and LOL-v2 Synthetic
+    based on a main data directory.
     """
     train_sources = [
         (
@@ -72,7 +72,7 @@ def build_default_sources(data_dir: str) -> tuple[list[tuple[str, str]], list[tu
         ),
     ]
 
-    # Filtra solo i percorsi che esistono realmente sul disco per evitare errori
+    # Filter only paths that actually exist on disk to avoid errors
     valid_train = [
         (low, high) for low, high in train_sources
         if os.path.exists(low) and os.path.exists(high)
@@ -131,7 +131,7 @@ def main(
         lr=1e-3,
     )
 
-    # Ricava le sorgenti di addestramento e validazione
+    # Obtain training and validation sources
     train_sources, val_sources = build_default_sources(data_dir)
 
     print("Sorgenti di Training caricate:")

@@ -10,8 +10,8 @@ from .base import BaseDataModule
 
 class LOLLightDataset(Dataset):
     """
-    PyTorch Dataset per il caricamento di coppie di immagini low-light e target.
-    Accetta percorsi espliciti per la cartella low-light e la cartella high-light.
+    PyTorch Dataset for loading pairs of low-light and target images.
+    Accepts explicit paths for the low-light folder and the high-light folder.
     """
     def __init__(
         self,
@@ -26,7 +26,7 @@ class LOLLightDataset(Dataset):
         self.high_dir = high_dir
         self.is_train = is_train
 
-        # Controllo di sicurezza sulle estensioni per evitare file nascosti (.DS_Store, ecc.)
+        # Safety check on file extensions to avoid hidden files (.DS_Store, etc.)
         valid_exts = ('.png', '.jpg', '.jpeg')
         self.image_filenames = sorted([
             f for f in os.listdir(self.low_dir)
@@ -39,7 +39,7 @@ class LOLLightDataset(Dataset):
                 v2.RandomHorizontalFlip(p=0.5),
                 v2.RandomVerticalFlip(p=0.5),
                 v2.ToImage(),
-                v2.ToDtype(torch.float32, scale=True)  # Converte in [0.0, 1.0]
+                v2.ToDtype(torch.float32, scale=True)  # Converts to [0.0, 1.0]
             ])
         else:
             self.transform = v2.Compose([
@@ -67,8 +67,8 @@ class LOLLightDataset(Dataset):
 
 class LOLLightDataModule(BaseDataModule):
     """
-    DataModule flessibile che unisce dinamiche liste di sorgenti (low_dir, high_dir)
-    in un unico stream di dati per PyTorch Lightning usando ConcatDataset.
+    Flexible DataModule that merges dynamic lists of sources (low_dir, high_dir)
+    into a single data stream for PyTorch Lightning using ConcatDataset.
     """
     def __init__(
         self,
@@ -93,7 +93,7 @@ class LOLLightDataModule(BaseDataModule):
                     "Devi passare almeno una coppia (low_dir, high_dir) in `train_sources` e `val_sources`."
                 )
 
-            # Crea le sotto-istanze di LOLLightDataset per ogni sorgente
+            # Create sub-instances of LOLLightDataset for each source
             train_subsets = [
                 LOLLightDataset(
                     low_dir=low,
@@ -114,7 +114,7 @@ class LOLLightDataModule(BaseDataModule):
                 for low, high in self.val_sources
             ]
 
-            # Unione in memoria tramite ConcatDataset
+            # In-memory merging using ConcatDataset
             self.train_dataset = ConcatDataset(train_subsets)
             self.val_dataset = ConcatDataset(val_subsets)
 

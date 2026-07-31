@@ -1,4 +1,5 @@
 import argparse
+import re
 from pathlib import Path
 
 import torch
@@ -10,16 +11,15 @@ from tqdm import tqdm
 
 from models import LowLightdenoiser, RestorationModule, UNet
 
-import re
 
 def find_matching_high_file(low_file: Path, high_dir: Path) -> Path | None:
-    """Cerca il file corrispondente in high_dir provando varie convenzioni di nome."""
-    # 1. Nome identico
+    """Searches for the corresponding file in high_dir by trying various naming conventions."""
+    # 1. Identical name
     direct = high_dir / low_file.name
     if direct.exists():
         return direct
 
-    # 2. Sostituzione prefissi comuni (es. low00690 -> normal00690)
+    # 2. Common prefix replacement (e.g., low00690 -> normal00690)
     name = low_file.name
     replacements = [
         name.replace("low", "normal").replace("Low", "Normal"),
@@ -32,7 +32,7 @@ def find_matching_high_file(low_file: Path, high_dir: Path) -> Path | None:
         if cand.exists():
             return cand
 
-    # 3. Match basato sull'ID numerico nel nome del file (es. '00690')
+    # 3. Match based on numeric ID in the file name (e.g., '00690')
     numbers = re.findall(r"\d+", low_file.stem)
     if numbers:
         target_num = numbers[-1]
@@ -46,7 +46,7 @@ def find_matching_high_file(low_file: Path, high_dir: Path) -> Path | None:
 
 
 def load_image(path: Path) -> torch.Tensor:
-    """Carica un'immagine come Tensor PyTorch [1, 3, H, W] in intervallo [0, 1]."""
+    """Loads an image as a PyTorch Tensor [1, 3, H, W] in range [0, 1]."""
     img = Image.open(path).convert("RGB")
     transform = v2.Compose([
         v2.ToImage(),
@@ -56,19 +56,19 @@ def load_image(path: Path) -> torch.Tensor:
 
 
 def resolve_first_existing(data_dir: Path, candidates: list[tuple[str, str]]) -> tuple[Path, Path]:
-    """Cerca la prima combinazione di cartelle (low, high/normal) esistente su disco."""
+    """Finds the first existing folder pair (low, high/normal) on disk."""
     for low_sub, high_sub in candidates:
         low_p = data_dir / low_sub
         high_p = data_dir / high_sub
         if low_p.exists() and high_p.exists():
             return low_p, high_p
-    # Se nessuna variante esiste, restituisce la prima opzione per far mostrare il log dettagliato
+    # If no variant exists, return the first option to trigger detailed log output
     return data_dir / candidates[0][0], data_dir / candidates[0][1]
 
 
 def get_eval_datasets(data_dir: Path) -> dict[str, tuple[Path, Path]]:
     """
-    Definisce i percorsi dei dataset supportando le varianti di nomi cartella più comuni.
+    Defines dataset paths supporting common folder naming variants.
     """
     v1_candidates = [
         ("LOL_v1/eval15/low", "LOL_v1/eval15/high"),
@@ -114,11 +114,11 @@ def evaluate_single_dataset(
     dataset_name: str,
     device: torch.device
 ) -> dict | None:
-    """Valuta il modello su una specifica coppia di cartelle low/high."""
+    """Evaluates the model on a specific pair of low/high directories."""
     if not low_dir.exists() or not high_dir.exists():
-        print(f"\n[SKIP] Cartelle non trovate per {dataset_name}:")
-        print(f"  - Low:  {low_dir} (Esiste: {low_dir.exists()})")
-        print(f"  - High: {high_dir} (Esiste: {high_dir.exists()})")
+        print(f"\n[SKIP] Directories not found for {dataset_name}:")
+        print(f"  - Low:  {low_dir} (Exists: {low_dir.exists()})")
+        print(f"  - High: {high_dir} (Exists: {high_dir.exists()})")
         return None
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -127,11 +127,11 @@ def evaluate_single_dataset(
     for ext in valid_exts:
         low_files.extend(sorted(low_dir.glob(ext)))
 
-    # Rimuove duplicati preservando l'ordine
+    # Remove duplicates while preserving order
     low_files = list(dict.fromkeys(low_files))
 
     if not low_files:
-        print(f"\n[SKIP] Nessuna immagine trovata in: {low_dir}")
+        print(f"\n[SKIP] No images found in: {low_dir}")
         return None
 
     all_psnr_pred, all_ssim_pred = [], []
@@ -150,10 +150,10 @@ def evaluate_single_dataset(
         pred = module(x)
         pred = torch.clamp(pred, 0.0, 1.0)
 
-        # Salvataggio output visivo
+        # Visual output saving
         save_image(pred.squeeze(0), out_dir / low_file.name)
 
-        # Calcolo metriche
+        # Metric computation
         pred_psnr = FM.peak_signal_noise_ratio(pred, y, data_range=1.0)
         pred_ssim = FM.structural_similarity_index_measure(pred, y, data_range=1.0)
         base_psnr = FM.peak_signal_noise_ratio(x, y, data_range=1.0)
@@ -165,7 +165,7 @@ def evaluate_single_dataset(
         all_ssim_base.append(base_ssim.item())
 
     if not all_psnr_pred:
-        print(f"\n[SKIP] Nessun match trovato tra i nomi file in Low e High per {dataset_name}.")
+        print(f"\n[SKIP] No match found between file names in Low and High for {dataset_name}.")
         return None
 
     avg_psnr_base = sum(all_psnr_base) / len(all_psnr_base)
@@ -186,23 +186,23 @@ def evaluate_single_dataset(
 
 def main():
     parser = argparse.ArgumentParser(description="Test Low-Light Enhancement Model")
-    parser.add_argument("--checkpoint", required=True, help="Path al file .ckpt")
-    parser.add_argument("--data_dir", default="data", help="Directory radice dei dati")
-    parser.add_argument("--output_dir", default="artifacts/eval_results", help="Directory di output")
-    parser.add_argument("--base_features", type=int, default=64, help="Numero di base features U-Net (es. 48 o 64)")
+    parser.add_argument("--checkpoint", required=True, help="Path to the .ckpt file")
+    parser.add_argument("--data_dir", default="data", help="Root data directory")
+    parser.add_argument("--output_dir", default="artifacts/eval_results", help="Output directory")
+    parser.add_argument("--base_features", type=int, default=64, help="Number of base U-Net features (e.g. 48 or 64)")
     parser.add_argument(
         "--dataset",
         type=str,
         default="all",
         choices=["all", "lol_v1", "lol_v2_real", "lol_v2_real_captured", "lol_v2_synthetic"],
-        help="Seleziona un dataset specifico o 'all' per testarli tutti",
+        help="Select a specific dataset or 'all' to test them all",
     )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Utilizzo dispositivo: {device}")
+    print(f"Using device: {device}")
 
-    # 1. Ricostruzione Architettura
+    # 1. Architecture Reconstruction
     unet = UNet(
         in_channels=3,
         out_channels=3,
@@ -212,8 +212,8 @@ def main():
     )
     denoiser = LowLightdenoiser(base_model=unet)
 
-    # 2. Caricamento Checkpoint
-    print(f"Caricamento checkpoint da: {args.checkpoint}")
+    # 2. Checkpoint Loading
+    print(f"Loading checkpoint from: {args.checkpoint}")
     module = RestorationModule.load_from_checkpoint(
         args.checkpoint,
         model=denoiser,
@@ -223,7 +223,7 @@ def main():
     module.eval()
     module.to(device)
 
-    # 3. Preparazione Dataset
+    # 3. Dataset Preparation
     data_path = Path(args.data_dir)
     output_path = Path(args.output_dir)
     eval_datasets = get_eval_datasets(data_path)
@@ -240,7 +240,7 @@ def main():
 
     results = {}
 
-    # 4. Esecuzione Test
+    # 4. Test Execution
     for ds_name, (low_dir, high_dir) in eval_datasets.items():
         res = evaluate_single_dataset(
             module, low_dir, high_dir, output_path / ds_name, ds_name, device
@@ -248,9 +248,9 @@ def main():
         if res:
             results[ds_name] = res
 
-    # 5. Stampa Tabella Risultati
+    # 5. Print Results Table
     if not results:
-        print("\nNessun dataset è stato processato con successo.")
+        print("\nNo datasets were processed successfully.")
         return
 
     print("\n" + "=" * 80)
@@ -282,11 +282,11 @@ def main():
         mean_ssim_out = tot_ssim_out / total_imgs
 
         print(
-            f"{'MEDIA GLOBALE':<18} | {total_imgs:<5} | {mean_psnr_in:<8.2f} | {mean_psnr_out:<8.2f} | "
+            f"{'GLOBAL AVERAGE':<18} | {total_imgs:<5} | {mean_psnr_in:<8.2f} | {mean_psnr_out:<8.2f} | "
             f"+{(mean_psnr_out - mean_psnr_in):<7.2f} | {mean_ssim_in:<8.4f} | {mean_ssim_out:<8.4f} | +{(mean_ssim_out - mean_ssim_in):<7.4f}"
         )
     print("=" * 80)
-    print(f"Immagini elaborate e salvate in: {output_path.resolve()}\n")
+    print(f"Processed images saved to: {output_path.resolve()}\n")
 
 
 if __name__ == "__main__":

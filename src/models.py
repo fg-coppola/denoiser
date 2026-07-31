@@ -540,8 +540,8 @@ class LowLightdenoiser(nn.Module):
                 self.unet.outc.bias.zero_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Gamma correction: schiarisce deterministicamente l'input.
-        # La rete non deve più imparare a illuminare, solo a correggere.
+        # Gamma correction: deterministically brightens the input.
+        # The network no longer needs to learn how to illuminate, only how to correct.
         x_corr = torch.pow(x.clamp(min=0.0), 0.4)
         return x_corr + self.unet(x_corr)
     

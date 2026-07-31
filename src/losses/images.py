@@ -6,7 +6,7 @@ import torchmetrics.functional.image as FM
 
 class CombinedLoss(nn.Module):
     """
-    Loss dal notebook Keras/TensorFlow:
+    Loss from the Keras/TensorFlow notebook:
     0.4 * MAE (L1 Loss) + 0.6 * SSIM Loss (1 - SSIM)
     """
     def __init__(self, w_mae: float = 0.4, w_ssim: float = 0.6):
