@@ -47,6 +47,9 @@ def compute_accumulation_steps(
 def main(
     experiment_name: str,
     output_folder: str,
+    train_data_dir: str = "data/libriSpeech",
+    val_data_dir: str = "data/audio/validation",
+    test_data_dir: str = "data/audio/test",
     training_subset: str = "dev-clean",
     batch_size: int = 24,
     base_features: int = 32,
@@ -101,9 +104,9 @@ def main(
     )
 
     rir_loader = RIRDataModule(
-        train_data_dir="data/libriSpeech",
-        val_data_dir="data/audio/validation",
-        test_data_dir="data/audio/test",
+        train_data_dir=train_data_dir,
+        val_data_dir=val_data_dir,
+        test_data_dir=test_data_dir,
         subset=training_subset,
         target_duration_seconds=3.0,
         synthetic_rir_paths=["data/rir/synthetic/train"],
@@ -175,11 +178,7 @@ def main(
         trainer.fit(rir_model, datamodule=rir_loader)
 
     print("Training complete. Running evaluation on the Test set...")
-    trainer.test(
-        rir_model,
-        datamodule=rir_loader,
-        ckpt_path="artifacts/checkpoints/rir_mr-stft-loss_train-clean-100_mixed_32_masking_v47/rir-best-epoch=30.ckpt",
-    )
+    trainer.test(rir_model, datamodule=rir_loader, ckpt_path="best")
 
 
 if __name__ == "__main__":
@@ -196,6 +195,24 @@ if __name__ == "__main__":
         type=str,
         default="artifacts",
         help="Base directory where logs and checkpoints will be saved",
+    )
+    parser.add_argument(
+        "--train_data_dir",
+        type=str,
+        default="data/libriSpeech",
+        help="Directory where LibriSpeech training data is located",
+    )
+    parser.add_argument(
+        "--val_data_dir",
+        type=str,
+        default="data/audio/validation",
+        help="Directory where static validation audio data is located",
+    )
+    parser.add_argument(
+        "--test_data_dir",
+        type=str,
+        default="data/audio/test",
+        help="Directory where static test audio data is located",
     )
     parser.add_argument(
         "--training_subset",
@@ -220,6 +237,9 @@ if __name__ == "__main__":
     main(
         experiment_name=args.experiment_name,
         output_folder=args.output_folder,
+        train_data_dir=args.train_data_dir,
+        val_data_dir=args.val_data_dir,
+        test_data_dir=args.test_data_dir,
         training_subset=args.training_subset,
         batch_size=args.batch_size,
         base_features=args.base_features,

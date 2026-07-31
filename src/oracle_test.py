@@ -1,3 +1,5 @@
+import argparse
+
 import torch
 from torchmetrics.audio import (
     PerceptualEvaluationSpeechQuality,
@@ -148,7 +150,7 @@ def run_offline_evaluation(
     )
 
     print("\n" + "=" * 50)
-    print("🔊 NOISY BASELINE RESULTS (Use these in Callback)")
+    print("NOISY BASELINE RESULTS (Use these in Callback)")
     print("=" * 50)
     print(f"  pesq_baseline:        {b_mean_pesq:.16f}")
     print(f"  test/baseline_pesq_std: {b_std_pesq:.16f}")
@@ -159,7 +161,7 @@ def run_offline_evaluation(
     print(f"  test/baseline_stoi_var: {b_var_stoi:.16f}")
 
     print("\n" + "=" * 50)
-    print("🎯 ORACLE TEST RESULTS (Clean Mag + Noisy Phase)")
+    print("ORACLE TEST RESULTS (Clean Mag + Noisy Phase)")
     print("=" * 50)
     print(f"  test/oracle_pesq:     {o_mean_pesq:.16f}")
     print(f"  test/oracle_pesq_std: {o_std_pesq:.16f}")
@@ -172,10 +174,22 @@ def run_offline_evaluation(
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Run offline evaluation for baseline & oracle performance."
+    )
+    parser.add_argument(
+        "--test_data_dir",
+        type=str,
+        default="data/audio/test",
+        help="Path to the directory containing test audio data.",
+    )
+
+    args = parser.parse_args()
+
     rir_loader = RIRDataModule(
         train_data_dir="data/libriSpeech",
         val_data_dir="data/audio/validation",
-        test_data_dir="data/audio/test",
+        test_data_dir=args.test_data_dir,
         subset="train-clean-100",
         target_duration_seconds=3.0,
         synthetic_rir_paths=["data/rir/synthetic/train"],
