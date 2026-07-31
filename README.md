@@ -10,6 +10,12 @@ python -m venv venv
 pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu130
 ```
 
+The training can be monitored with the following command
+```bash
+tensorboard --logdir=artifacts/logs/
+```
+
+
 ## Audio (Speech Dereverberation)
 
 The ground-truth clean audio dataset is LibriSpeech (which is downloaded automatically by the data preparation script). To simulate environmental reverberation, Room Impulse Responses (RIRs) from the Aachen Impulse Response (AIR) database are utilized.
@@ -60,10 +66,7 @@ To start training the U-Net on the speech dereverberation task, run the followin
 python src/audio_training.py --experiment_name rir_mr-stft-loss_train-clean-100_mixed_32_masking_v47 --output_folder artifacts --training_subset train-clean-100 --batch_size 64 --base_features 32 --train_data_dir data/libriSpeech --val_data_dir data/audio/validation --test_data_dir data/audio/test
 ```
 
-The training can be monitored with the following command
-```bash
-tensorboard --logdir=artifacts/logs/
-```
+
 
 ## Images (Low-Light Image Enhancement)
 
@@ -72,16 +75,35 @@ For the photographic task of recovering images in low-light conditions, the mode
 ### Download and Data Preparation (Images)
 
 Download the following datasets and place them in the designated images data directory (e.g., `data/images/`):
-- [LOL v1 Dataset - Link Placeholder](#)
-- [LOL v2 Real Dataset - Link Placeholder](#)
-- [LOL v2 Synthetic Dataset - Link Placeholder](#)
+- [LOL v1 Dataset](https://www.kaggle.com/datasets/soumikrakshit/lol-dataset)
+- [LOL v2 Dataset](https://www.kaggle.com/datasets/tanhyml/lol-v2-dataset?select=LOL-v2)
 
-Extract the contents of the archives while preserving the original directory structure. This ensures the dataloaders can correctly map the input "low-light" images to their respective well-lit ground-truth targets.
 
-### Training (Images)
+Download the LOL dataset family and organize them under a single root folder (e.g., `./data`). Extract the contents of the archives while preserving the original directory structure. This ensures the dataloaders can correctly map the input "low-light" images to their respective well-lit ground-truth targets.
 
-To start training the U-Net on the low-light image enhancement task, execute the dedicated script:
+### Training, Evaluation and Testing (Images)
+
+The low-light enhancement pipeline is handled by `image_training.py`.  
+It expects the LOL datasets to be arranged as described in [Download and Data Preparation](#dataset-setup) and will automatically merge LOL v1, v2 Real and v2 Synthetic for training.
+
 ```bash
-# Start the low-light image enhancement training pipeline
-python train_images.py
-```
+# training
+python src\image_training.py \
+    --experiment_name \
+    --data_dir \
+    --output_folder \
+    --batch_size \
+    --accumulate_grad_batches \
+    --max_epochs
+
+# evaluation
+python src\LL_evaluation_test.py \
+    --checkpoint \
+    --eval_dir \
+    --output_dir
+
+# testing
+python src\image_inference.py \
+    --checkpoint \
+    --eval_dir \
+    --output_dir  
