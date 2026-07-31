@@ -88,22 +88,10 @@ It expects the LOL datasets to be arranged as described in [Download and Data Pr
 
 ```bash
 # training
-python src\image_training.py \
-    --experiment_name \
-    --data_dir \
-    --output_folder \
-    --batch_size \
-    --accumulate_grad_batches \
-    --max_epochs
+python src/image_training.py --experiment_name LL_combinedLoss_FINAL_checkingsomething --output_folder artifacts --data_dir data  
 
 # evaluation
-python src\LL_evaluation_test.py \
-    --checkpoint \
-    --eval_dir \
-    --output_dir
+python src/LL_evaluation_test.py --checkpoint artifacts/checkpoints/LL_combinedLoss_FINAL/lowlight-best-epoch=35-val_loss/total=0.1292.ckpt --data_dir data --output_dir artifacts/eva_results_combinedLoss_FINAL --base_features 48
 
 # testing
-python src\image_inference.py \
-    --checkpoint \
-    --eval_dir \
-    --output_dir  
+python src/image_inference.py --checkpoint artifacts/checkpoints/LL_combinedLoss_64f_v1/lowlight-best-epoch=78-val_loss/total=0.1256.ckpt --input artifacts/image_testing --base_features 48   
