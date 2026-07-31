@@ -1,9 +1,9 @@
 from typing import Any
-
 import pytorch_lightning as L
 import torch
 import torch.nn.functional as F
 from torch import nn, optim
+
 
 
 class DoubleConv(nn.Module):
@@ -48,7 +48,7 @@ class DoubleConv(nn.Module):
                 bias=False,  # Bias is redundant before GroupNorm
             ),
             nn.GroupNorm(gn_groups, out_channels),
-            nn.SiLU(inplace=True),
+            nn.SiLU(inplace=False),
         ]
 
         if dropout > 0.0:
@@ -64,7 +64,7 @@ class DoubleConv(nn.Module):
                     bias=False,
                 ),
                 nn.GroupNorm(gn_groups, out_channels),
-                nn.SiLU(inplace=True),
+                nn.SiLU(inplace=False),
             ]
         )
 
@@ -529,6 +529,23 @@ class MagnitudeIRMNoisyPhaseDenoiser(nn.Module):
         return pred_real, pred_imag
 
 
+
+class LowLightdenoiser(nn.Module):
+    def __init__(self, base_model: nn.Module):
+        super().__init__()
+        self.unet = base_model
+        with torch.no_grad():
+            self.unet.outc.weight.zero_()
+            if self.unet.outc.bias is not None:
+                self.unet.outc.bias.zero_()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Gamma correction: deterministically brightens the input.
+        # The network no longer needs to learn how to illuminate, only how to correct.
+        x_corr = torch.pow(x.clamp(min=0.0), 0.4)
+        return x_corr + self.unet(x_corr)
+    
+    
 class RestorationModule(L.LightningModule):
     """
     Generic LightningModule wrapper for signal/image restoration tasks.
