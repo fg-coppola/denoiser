@@ -20,6 +20,10 @@ The ground-truth clean audio dataset is LibriSpeech (which is downloaded automat
    - [Aachen Impulse Response (AIR) Database](https://www.iks.rwth-aachen.de/en/research/tools-downloads/databases/aachen-impulse-response-database/)
    
    Extract the downloaded files into a temporary directory (e.g., `data/AIR/`).
+   Then run the following script to split the AIR dataset into three parts for training, validation and testing without room overlap.
+   ```bash
+   python src/create_air_splits.py --source_dir data/AIR --output_dir data/rir/real
+   ```
 
 2. **Generate the synthetic RIRs:**
    Run the generation script, which will create the required RIRs via ShoeBox simulation.
