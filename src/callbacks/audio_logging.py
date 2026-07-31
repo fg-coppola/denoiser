@@ -179,16 +179,32 @@ class AudioLoggerCallback(L.Callback):
                 dataset = current_dataloader.dataset
 
                 file_stem = dataset.clean_files[batch_idx].stem
-                file_name = f"{file_stem}_recon.wav"
 
-                out_path = self.save_dir / stage / file_name
-                out_path.parent.mkdir(parents=True, exist_ok=True)
+                # Reconstructed audio
+                recon_file_name = f"{file_stem}_recon.wav"
+                recon_out_path = self.save_dir / stage / recon_file_name
+                recon_out_path.parent.mkdir(parents=True, exist_ok=True)
 
-                wav_to_save = pred_wav.detach().cpu()
-                if wav_to_save.dim() == 1:
-                    wav_to_save = wav_to_save.unsqueeze(0)
+                recon_wav_to_save = pred_wav.detach().cpu()
+                if recon_wav_to_save.dim() == 1:
+                    recon_wav_to_save = recon_wav_to_save.unsqueeze(0)
 
-                torchaudio.save(str(out_path), wav_to_save, self.sample_rate)
+                torchaudio.save(
+                    str(recon_out_path), recon_wav_to_save, self.sample_rate
+                )
+
+                # Oracle phase audio
+                oracle_file_name = f"{file_stem}_oracle.wav"
+                oracle_out_path = self.save_dir / stage / oracle_file_name
+                oracle_out_path.parent.mkdir(parents=True, exist_ok=True)
+
+                oracle_wav_to_save = oracle_wav.detach().cpu()
+                if oracle_wav_to_save.dim() == 1:
+                    oracle_wav_to_save = oracle_wav_to_save.unsqueeze(0)
+
+                torchaudio.save(
+                    str(oracle_out_path), oracle_wav_to_save, self.sample_rate
+                )
 
         except Exception as e:
             print(f"[Warning] Failed to generate {stage} audio in callback: {e}")
