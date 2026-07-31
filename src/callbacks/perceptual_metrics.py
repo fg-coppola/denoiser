@@ -231,8 +231,8 @@ class PerceptualMetricsCallback(L.Callback):
         var_oracle_mag_stoi = op_stoi_t.var(unbiased=True).item()
         std_oracle_mag_stoi = op_stoi_t.std(unbiased=True).item()
 
-        delta_pesq = mean_pesq - self.pesq_baseline
-        delta_stoi = mean_stoi - self.stoi_baseline
+        delta_pesq = mean_pesq - self.test_pesq_baseline
+        delta_stoi = mean_stoi - self.test_stoi_baseline
 
         # Log final aggregated test metrics and distribution stats
         pl_module.log("test/pesq", mean_pesq, sync_dist=True)
@@ -243,8 +243,8 @@ class PerceptualMetricsCallback(L.Callback):
         pl_module.log("test/stoi_var", var_stoi, sync_dist=True)
         pl_module.log("test/stoi_std", std_stoi, sync_dist=True)
 
-        pl_module.log("test/baseline_pesq", self.pesq_baseline, sync_dist=True)
-        pl_module.log("test/baseline_stoi", self.stoi_baseline, sync_dist=True)
+        pl_module.log("test/baseline_pesq", self.test_pesq_baseline, sync_dist=True)
+        pl_module.log("test/baseline_stoi", self.test_stoi_baseline, sync_dist=True)
 
         pl_module.log("test/delta_pesq", delta_pesq, sync_dist=True)
         pl_module.log("test/delta_stoi", delta_stoi, sync_dist=True)
