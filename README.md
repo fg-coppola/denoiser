@@ -1,1 +1,83 @@
-# denoiser
+# Denoiser
+
+This repository contains a U-Net model and the necessary tools to train it on two distinct multimedia signal denoising tasks: speech dereverberation and low-light image enhancement.
+Below are the instructions for training both models.
+The first thing to do for both tasks is to create a venv and install the necessary dependencies:
+
+```bash
+python -m venv venv
+
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu130
+```
+
+## Audio (Speech Dereverberation)
+
+The ground-truth clean audio dataset is LibriSpeech (which is downloaded automatically by the data preparation script). To simulate environmental reverberation, Room Impulse Responses (RIRs) from the Aachen Impulse Response (AIR) database are utilized.
+
+### Download and Data Preparation (Audio)
+
+1. **Download the RIR dataset:**
+   - [Aachen Impulse Response (AIR) Database](https://www.iks.rwth-aachen.de/en/research/tools-downloads/databases/aachen-impulse-response-database/)
+   
+   Extract the downloaded files into a temporary directory (e.g., `data/AIR/`).
+
+2. **Generate the synthetic RIRs:**
+   Run the generation script, which will create the required RIRs via ShoeBox simulation.
+   ```bash
+   # train
+   python src/generate_rirs.py --output_dir data/rir/synthetic/train --num_rirs 30000 --sample_rate 16000 --format pt --normalize none --seed 42
+
+   # validation
+   python src/generate_rirs.py --output_dir data/rir/synthetic/validation --num_rirs 5000 --sample_rate 16000 --format pt --normalize none --seed 999
+
+   # test
+   python src/generate_rirs.py --output_dir data/rir/synthetic/test --num_rirs 5000 --sample_rate 16000 --format pt --normalize none --seed 1234
+   ```
+
+3. **Generate static datasets (Validation / Test):**
+   Run the setup script. This script will automatically download the required LibriSpeech subsets, generate fixed pairs of clean and reverberated audio (using both synthetic and real RIRs) and save them to disk for the validation and test sets.
+   ```bash
+   # validation
+   python src/generate_static_datasets.py --split_name validation --ls_subset dev-clean --synth_rir_dir data/rir/synthetic/validation/ --real_rir_dir data/rir/real/validation/ --target_duration 3.0 --output_dir data/audio/validation --source_dir data/libriSpeech/
+
+   # test
+   python src/generate_static_datasets.py --split_name test --ls_subset test-clean --synth_rir_dir data/rir/synthetic/test/ --real_rir_dir data/rir/real/test/ --output_dir data/audio/test --source_dir data/libriSpeech/
+   ```
+
+### Training and evaluation (Audio)
+
+A dedicated script is provided to calculate baseline and oracle metrics (PESQ and STOI) on the static test dataset generated in the previous step. The resulting baseline metrics are passed to the testing code to calculate the delta directly (the values for the datasets created as above are already hardcoded inside the training/testing script, but can be changed there for different datasets)
+```bash
+python src/oracle_test.py --test_data_dir data/audio/test
+```
+
+To start training the U-Net on the speech dereverberation task, run the following command, which will also download the necessary Librispeech training subset if it isn't already in the provided source_dir. The script will also launch a testing run at the end. The training parameters were optimized to run on a RTX 5070 TI with 16 GB of VRAM and on Linux.
+```bash
+python src/audio_training.py --experiment_name rir_mr-stft-loss_train-clean-100_mixed_32_masking_v47 --output_folder artifacts --training_subset train-clean-100 --batch_size 64 --base_features 32 --train_data_dir data/libriSpeech --val_data_dir data/audio/validation --test_data_dir data/audio/test
+```
+
+The training can be monitored with the following command
+```bash
+tensorboard --logdir=artifacts/logs/
+```
+
+## Images (Low-Light Image Enhancement)
+
+For the photographic task of recovering images in low-light conditions, the model relies on the LOL datasets.
+
+### Download and Data Preparation (Images)
+
+Download the following datasets and place them in the designated images data directory (e.g., `data/images/`):
+- [LOL v1 Dataset - Link Placeholder](#)
+- [LOL v2 Real Dataset - Link Placeholder](#)
+- [LOL v2 Synthetic Dataset - Link Placeholder](#)
+
+Extract the contents of the archives while preserving the original directory structure. This ensures the dataloaders can correctly map the input "low-light" images to their respective well-lit ground-truth targets.
+
+### Training (Images)
+
+To start training the U-Net on the low-light image enhancement task, execute the dedicated script:
+```bash
+# Start the low-light image enhancement training pipeline
+python train_images.py
+```
