@@ -1,46 +1,47 @@
 import os
+from PIL import Image
 import torch
 import pytorch_lightning as L
-from torch.utils.data import DataLoader
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torchvision.transforms import v2
-from PIL import Image
+
 from .base import BaseDataModule
+
 
 class LOLLightDataset(Dataset):
     """
-    PyTorch Dataset for the LOL (LOw-Light) dataset.
-    Applies heavy data augmentation to artificially multiply the 485 training pairs
-    and prevent U-Net overfitting.
+    PyTorch Dataset per il caricamento di coppie di immagini low-light e target.
+    Accetta percorsi espliciti per la cartella low-light e la cartella high-light.
     """
     def __init__(
-        self, 
-        root_dir: str, 
-        patch_size: int = 256, 
+        self,
+        low_dir: str,
+        high_dir: str,
+        patch_size: int = 256,
         is_train: bool = True
     ):
         super().__init__()
-        
-        # Setup directories for low-light inputs and normal-light targets
-        self.low_dir = os.path.join(root_dir, 'low')
-        self.high_dir = os.path.join(root_dir, 'high')
-        
-        # Ensure consistent ordering between input and target images
-        self.image_filenames = sorted(os.listdir(self.low_dir))
+
+        self.low_dir = low_dir
+        self.high_dir = high_dir
         self.is_train = is_train
-        
-        # Modern torchvision v2 allows passing multiple images to the same transform
-        # ensuring random crops and flips are applied identically to both
+
+        # Controllo di sicurezza sulle estensioni per evitare file nascosti (.DS_Store, ecc.)
+        valid_exts = ('.png', '.jpg', '.jpeg')
+        self.image_filenames = sorted([
+            f for f in os.listdir(self.low_dir)
+            if f.lower().endswith(valid_exts)
+        ])
+
         if self.is_train:
             self.transform = v2.Compose([
                 v2.RandomCrop(size=(patch_size, patch_size)),
                 v2.RandomHorizontalFlip(p=0.5),
                 v2.RandomVerticalFlip(p=0.5),
                 v2.ToImage(),
-                v2.ToDtype(torch.float32, scale=True) # Converts to [0.0, 1.0] range
+                v2.ToDtype(torch.float32, scale=True)  # Converte in [0.0, 1.0]
             ])
         else:
-            # During validation/testing, we use a deterministic center crop
             self.transform = v2.Compose([
                 v2.CenterCrop(size=(patch_size, patch_size)),
                 v2.ToImage(),
@@ -52,74 +53,86 @@ class LOLLightDataset(Dataset):
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         img_name = self.image_filenames[idx]
-        
+
         low_path = os.path.join(self.low_dir, img_name)
         high_path = os.path.join(self.high_dir, img_name)
-        
-        # Load images as standard RGB PIL Images
+
         low_img = Image.open(low_path).convert('RGB')
         high_img = Image.open(high_path).convert('RGB')
-        
-        # Apply identical transformations to BOTH images simultaneously
+
         low_tensor, high_tensor = self.transform(low_img, high_img)
-        
+
         return low_tensor, high_tensor
+
 
 class LOLLightDataModule(BaseDataModule):
     """
-    Gestisce il caricamento del dataset LOL, incapsulando i DataLoader
-    e i parametri operativi per PyTorch Lightning.
+    DataModule flessibile che unisce dinamiche liste di sorgenti (low_dir, high_dir)
+    in un unico stream di dati per PyTorch Lightning usando ConcatDataset.
     """
     def __init__(
         self,
-        data_dir: str = "./LOLdataset",
-        batch_size: int = 8,        # 8 o 16 sono ideali per patch 256x256 su GPU medie
+        train_sources: list[tuple[str, str]] | None = None,
+        val_sources: list[tuple[str, str]] | None = None,
+        batch_size: int = 8,
         patch_size: int = 256,
-        num_workers: int = 4,       # Regola in base ai core della tua CPU
+        num_workers: int = 4,
         **kwargs
     ):
         super().__init__(**kwargs)
-        self.data_dir = data_dir
+        self.train_sources = train_sources or []
+        self.val_sources = val_sources or []
         self.batch_size = batch_size
         self.patch_size = patch_size
         self.num_workers = num_workers
-        
 
     def setup(self, stage: str | None = None):
-        """
-        Inizializza i dataset. Viene chiamato automaticamente da Lightning su ogni GPU.
-        """
-        # I percorsi seguono la struttura standard del dataset LOL
-        train_dir = os.path.join(self.data_dir, "our485")
-        val_dir = os.path.join(self.data_dir, "eval15")
-
         if stage == "fit" or stage is None:
-            self.train_dataset = LOLLightDataset(
-                root_dir=train_dir,
-                patch_size=self.patch_size,
-                is_train=True
-            )
-            self.val_dataset = LOLLightDataset(
-                root_dir=val_dir,
-                patch_size=self.patch_size,
-                is_train=False
-            )
+            if not self.train_sources or not self.val_sources:
+                raise ValueError(
+                    "Devi passare almeno una coppia (low_dir, high_dir) in `train_sources` e `val_sources`."
+                )
+
+            # Crea le sotto-istanze di LOLLightDataset per ogni sorgente
+            train_subsets = [
+                LOLLightDataset(
+                    low_dir=low,
+                    high_dir=high,
+                    patch_size=self.patch_size,
+                    is_train=True
+                )
+                for low, high in self.train_sources
+            ]
+
+            val_subsets = [
+                LOLLightDataset(
+                    low_dir=low,
+                    high_dir=high,
+                    patch_size=self.patch_size,
+                    is_train=False
+                )
+                for low, high in self.val_sources
+            ]
+
+            # Unione in memoria tramite ConcatDataset
+            self.train_dataset = ConcatDataset(train_subsets)
+            self.val_dataset = ConcatDataset(val_subsets)
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            shuffle=True,              # Fondamentale per il training
+            shuffle=True,
             num_workers=self.num_workers,
-            pin_memory=True,           # Velocizza il trasferimento dati da CPU a GPU
-            drop_last=True             # Evita crash se l'ultimo batch ha dimensioni diverse
+            pin_memory=True,
+            drop_last=True
         )
 
     def val_dataloader(self) -> DataLoader:
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
-            shuffle=False,             # Non serve fare shuffle in validazione
+            shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,
             drop_last=False
